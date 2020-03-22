@@ -14,12 +14,20 @@
 package api
 
 import (
+	"encoding/json"
+	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/gorilla/mux"
-	"github.com/pingcap/pd/server"
+	"github.com/pingcap/pd/v4/pkg/apiutil"
+	"github.com/pingcap/pd/v4/server"
+	"github.com/pingcap/pd/v4/server/cluster"
+	"github.com/pingcap/pd/v4/server/schedulers"
 	"github.com/unrolled/render"
 )
+
+const schedulerConfigPrefix = "pd/api/v1/scheduler-config"
 
 type schedulerHandler struct {
 	*server.Handler
@@ -44,8 +52,7 @@ func (h *schedulerHandler) List(w http.ResponseWriter, r *http.Request) {
 
 func (h *schedulerHandler) Post(w http.ResponseWriter, r *http.Request) {
 	var input map[string]interface{}
-	if err := readJSON(r.Body, &input); err != nil {
-		h.r.JSON(w, http.StatusInternalServerError, err.Error())
+	if err := apiutil.ReadJSONRespondError(h.r, w, r.Body, &input); err != nil {
 		return
 	}
 
@@ -56,46 +63,52 @@ func (h *schedulerHandler) Post(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch name {
-	case "balance-leader-scheduler":
+	case schedulers.BalanceLeaderName:
 		if err := h.AddBalanceLeaderScheduler(); err != nil {
 			h.r.JSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-	case "balance-hot-region-scheduler":
+	case schedulers.HotRegionName:
 		if err := h.AddBalanceHotRegionScheduler(); err != nil {
 			h.r.JSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-	case "balance-region-scheduler":
+	case schedulers.BalanceRegionName:
 		if err := h.AddBalanceRegionScheduler(); err != nil {
 			h.r.JSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-	case "label-scheduler":
+	case schedulers.LabelName:
 		if err := h.AddLabelScheduler(); err != nil {
 			h.r.JSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-	case "scatter-range":
+	case schedulers.ScatterRangeName:
 		var args []string
-		startKey, ok := input["start_key"].(string)
-		if ok {
-			args = append(args, startKey)
+
+		collector := func(v string) {
+			args = append(args, v)
 		}
-		endKey, ok := input["end_key"].(string)
-		if ok {
-			args = append(args, endKey)
+		if err := collectEscapeStringOption("start_key", input, collector); err != nil {
+			h.r.JSON(w, http.StatusInternalServerError, err.Error())
+			return
 		}
-		name, ok := input["range_name"].(string)
-		if ok {
-			args = append(args, name)
+
+		if err := collectEscapeStringOption("end_key", input, collector); err != nil {
+			h.r.JSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		if err := collectStringOption("range_name", input, collector); err != nil {
+			h.r.JSON(w, http.StatusInternalServerError, err.Error())
+			return
 		}
 		if err := h.AddScatterRangeScheduler(args...); err != nil {
 			h.r.JSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 
-	case "balance-adjacent-region-scheduler":
+	case schedulers.AdjacentRegionName:
 		var args []string
 		leaderLimit, ok := input["leader_limit"].(string)
 		if ok {
@@ -104,45 +117,68 @@ func (h *schedulerHandler) Post(w http.ResponseWriter, r *http.Request) {
 		peerLimit, ok := input["peer_limit"].(string)
 		if ok {
 			args = append(args, peerLimit)
-		} else {
-			args = args[:0]
 		}
+
 		if err := h.AddAdjacentRegionScheduler(args...); err != nil {
 			h.r.JSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-	case "grant-leader-scheduler":
+	case schedulers.GrantLeaderName:
 		storeID, ok := input["store_id"].(float64)
 		if !ok {
 			h.r.JSON(w, http.StatusBadRequest, "missing store id")
 			return
 		}
-		if err := h.AddGrantLeaderScheduler(uint64(storeID)); err != nil {
+		err := h.AddGrantLeaderScheduler(uint64(storeID))
+		if err == cluster.ErrSchedulerExisted {
+			if err := h.redirectSchedulerUpdate(schedulers.GrantLeaderName, storeID); err != nil {
+				h.r.JSON(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		}
+		if err != nil && err != cluster.ErrSchedulerExisted {
 			h.r.JSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-	case "evict-leader-scheduler":
+	case schedulers.EvictLeaderName:
 		storeID, ok := input["store_id"].(float64)
 		if !ok {
 			h.r.JSON(w, http.StatusBadRequest, "missing store id")
 			return
 		}
-		if err := h.AddEvictLeaderScheduler(uint64(storeID)); err != nil {
+		err := h.AddEvictLeaderScheduler(uint64(storeID))
+		if err == cluster.ErrSchedulerExisted {
+			if err := h.redirectSchedulerUpdate(schedulers.EvictLeaderName, storeID); err != nil {
+				h.r.JSON(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		}
+		if err != nil && err != cluster.ErrSchedulerExisted {
 			h.r.JSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-	case "shuffle-leader-scheduler":
+	case schedulers.ShuffleLeaderName:
 		if err := h.AddShuffleLeaderScheduler(); err != nil {
 			h.r.JSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-	case "shuffle-region-scheduler":
+	case schedulers.ShuffleRegionName:
 		if err := h.AddShuffleRegionScheduler(); err != nil {
 			h.r.JSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-	case "random-merge-scheduler":
+	case schedulers.RandomMergeName:
 		if err := h.AddRandomMergeScheduler(); err != nil {
+			h.r.JSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	case schedulers.ShuffleHotRegionName:
+		limit := uint64(1)
+		l, ok := input["limit"].(float64)
+		if ok {
+			limit = uint64(l)
+		}
+		if err := h.AddShuffleHotRegionScheduler(limit); err != nil {
 			h.r.JSON(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -154,13 +190,91 @@ func (h *schedulerHandler) Post(w http.ResponseWriter, r *http.Request) {
 	h.r.JSON(w, http.StatusOK, nil)
 }
 
+func (h *schedulerHandler) redirectSchedulerUpdate(name string, storeID float64) error {
+	input := make(map[string]interface{})
+	input["name"] = name
+	input["store_id"] = storeID
+	updateURL := fmt.Sprintf("%s/%s/%s/config", h.GetAddr(), schedulerConfigPrefix, name)
+	body, err := json.Marshal(input)
+	if err != nil {
+		return err
+	}
+	return postJSON(updateURL, body)
+}
+
 func (h *schedulerHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	name := mux.Vars(r)["name"]
+	switch {
+	case strings.HasPrefix(name, schedulers.EvictLeaderName) && name != schedulers.EvictLeaderName:
+		if err := h.redirectSchedulerDelete(name, schedulers.EvictLeaderName); err != nil {
+			h.r.JSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	case strings.HasPrefix(name, schedulers.GrantLeaderName) && name != schedulers.GrantLeaderName:
+		if err := h.redirectSchedulerDelete(name, schedulers.GrantLeaderName); err != nil {
+			h.r.JSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	default:
+		if err := h.RemoveScheduler(name); err != nil {
+			h.r.JSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	h.r.JSON(w, http.StatusOK, nil)
+}
 
-	if err := h.RemoveScheduler(name); err != nil {
-		h.r.JSON(w, http.StatusInternalServerError, err.Error())
+func (h *schedulerHandler) redirectSchedulerDelete(name, schedulerName string) error {
+	args := strings.Split(name, "-")
+	args = args[len(args)-1:]
+	url := fmt.Sprintf("%s/%s/%s/delete/%s", h.GetAddr(), schedulerConfigPrefix, schedulerName, args[0])
+	resp, err := doDelete(url)
+	if resp.StatusCode != 200 {
+		return cluster.ErrSchedulerNotFound
+	}
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (h *schedulerHandler) PauseOrResume(w http.ResponseWriter, r *http.Request) {
+	var input map[string]int
+	if err := apiutil.ReadJSONRespondError(h.r, w, r.Body, &input); err != nil {
 		return
 	}
 
+	name := mux.Vars(r)["name"]
+	t, ok := input["delay"]
+	if !ok {
+		h.r.JSON(w, http.StatusBadRequest, "missing pause time")
+		return
+	}
+	if err := h.PauseOrResumeScheduler(name, int64(t)); err != nil {
+		h.r.JSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	h.r.JSON(w, http.StatusOK, nil)
+}
+
+type schedulerConfigHandler struct {
+	svr *server.Server
+	rd  *render.Render
+}
+
+func newSchedulerConfigHandler(svr *server.Server, rd *render.Render) *schedulerConfigHandler {
+	return &schedulerConfigHandler{
+		svr: svr,
+		rd:  rd,
+	}
+}
+
+func (h *schedulerConfigHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	handler := h.svr.GetHandler()
+	sh := handler.GetSchedulerConfigHandler()
+	if sh != nil {
+		sh.ServeHTTP(w, r)
+		return
+	}
+	h.rd.JSON(w, http.StatusNotAcceptable, errNoImplement)
 }

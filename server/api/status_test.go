@@ -16,28 +16,21 @@ package api
 import (
 	"encoding/json"
 	"io/ioutil"
-	"net/http"
 
 	. "github.com/pingcap/check"
-	"github.com/pingcap/pd/server"
+	"github.com/pingcap/pd/v4/server"
 )
 
 var _ = Suite(&testStatusAPISuite{})
 
-type testStatusAPISuite struct {
-	hc *http.Client
-}
+type testStatusAPISuite struct{}
 
-func (s *testStatusAPISuite) SetUpSuite(c *C) {
-	s.hc = newHTTPClient()
-}
-
-func checkStatusResponse(c *C, body []byte, cfgs []*server.Config) {
+func checkStatusResponse(c *C, body []byte) {
 	got := status{}
-	json.Unmarshal(body, &got)
-
+	c.Assert(json.Unmarshal(body, &got), IsNil)
 	c.Assert(got.BuildTS, Equals, server.PDBuildTS)
 	c.Assert(got.GitHash, Equals, server.PDGitHash)
+	c.Assert(got.Version, Equals, server.PDReleaseVersion)
 }
 
 func (s *testStatusAPISuite) TestStatus(c *C) {
@@ -46,11 +39,11 @@ func (s *testStatusAPISuite) TestStatus(c *C) {
 
 	for _, cfg := range cfgs {
 		addr := cfg.ClientUrls + apiPrefix + "/api/v1/status"
-		resp, err := s.hc.Get(addr)
+		resp, err := dialClient.Get(addr)
 		c.Assert(err, IsNil)
-		defer resp.Body.Close()
 		buf, err := ioutil.ReadAll(resp.Body)
 		c.Assert(err, IsNil)
-		checkStatusResponse(c, buf, cfgs)
+		checkStatusResponse(c, buf)
+		resp.Body.Close()
 	}
 }

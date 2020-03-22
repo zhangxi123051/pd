@@ -19,18 +19,20 @@ import (
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/kvproto/pkg/metapb"
-	"github.com/pingcap/pd/server"
+	"github.com/pingcap/pd/v4/server"
+	"github.com/pingcap/pd/v4/server/cluster"
+	"github.com/pingcap/pd/v4/server/config"
 )
 
-var _ = Suite(&testClusterInfo{})
+var _ = Suite(&testClusterSuite{})
 
-type testClusterInfo struct {
+type testClusterSuite struct {
 	svr       *server.Server
 	cleanup   cleanUpFunc
 	urlPrefix string
 }
 
-func (s *testClusterInfo) SetUpSuite(c *C) {
+func (s *testClusterSuite) SetUpSuite(c *C) {
 	s.svr, s.cleanup = mustNewServer(c)
 	mustWaitLeader(c, []*server.Server{s.svr})
 
@@ -38,34 +40,42 @@ func (s *testClusterInfo) SetUpSuite(c *C) {
 	s.urlPrefix = fmt.Sprintf("%s%s/api/v1", addr, apiPrefix)
 }
 
-func (s *testClusterInfo) TearDownSuite(c *C) {
+func (s *testClusterSuite) TearDownSuite(c *C) {
 	s.cleanup()
 }
 
-func (s *testClusterInfo) TestCluster(c *C) {
+func (s *testClusterSuite) TestCluster(c *C) {
 	url := fmt.Sprintf("%s/cluster", s.urlPrefix)
 	c1 := &metapb.Cluster{}
-	err := readJSONWithURL(url, c1)
+	err := readJSON(url, c1)
 	c.Assert(err, IsNil)
 
 	c2 := &metapb.Cluster{}
-	r := server.ReplicationConfig{MaxReplicas: 6}
-	s.svr.SetReplicationConfig(r)
-	err = readJSONWithURL(url, c2)
+	r := config.ReplicationConfig{MaxReplicas: 6}
+	c.Assert(s.svr.SetReplicationConfig(r), IsNil)
+	err = readJSON(url, c2)
 	c.Assert(err, IsNil)
 
 	c1.MaxPeerCount = 6
 	c.Assert(c1, DeepEquals, c2)
 }
 
-func (s *testClusterInfo) TestGetClusterStatus(c *C) {
+func (s *testClusterSuite) TestGetClusterStatus(c *C) {
 	url := fmt.Sprintf("%s/cluster/status", s.urlPrefix)
-	status := server.ClusterStatus{}
-	err := readJSONWithURL(url, &status)
+	status := cluster.Status{}
+	err := readJSON(url, &status)
+	c.Assert(err, IsNil)
 	c.Assert(status.RaftBootstrapTime.IsZero(), IsTrue)
+	c.Assert(status.IsInitialized, IsFalse)
 	now := time.Now()
 	mustBootstrapCluster(c, s.svr)
-	err = readJSONWithURL(url, &status)
+	err = readJSON(url, &status)
 	c.Assert(err, IsNil)
 	c.Assert(status.RaftBootstrapTime.After(now), IsTrue)
+	c.Assert(status.IsInitialized, IsFalse)
+	s.svr.SetReplicationConfig(config.ReplicationConfig{MaxReplicas: 1})
+	err = readJSON(url, &status)
+	c.Assert(err, IsNil)
+	c.Assert(status.RaftBootstrapTime.After(now), IsTrue)
+	c.Assert(status.IsInitialized, IsTrue)
 }

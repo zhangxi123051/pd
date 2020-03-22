@@ -15,11 +15,10 @@ package api
 
 import (
 	"fmt"
-	"net/http"
 
 	. "github.com/pingcap/check"
-	"github.com/pingcap/pd/server"
-	_ "github.com/pingcap/pd/server/schedulers"
+	"github.com/pingcap/pd/v4/server"
+	_ "github.com/pingcap/pd/v4/server/schedulers"
 )
 
 var _ = Suite(&testHotStatusSuite{})
@@ -45,9 +44,7 @@ func (s *testHotStatusSuite) TearDownSuite(c *C) {
 }
 
 func (s testHotStatusSuite) TestGetHotStore(c *C) {
-	stat := hotStoreStats{}
-	resp, err := http.Get(s.urlPrefix + "/stores")
-	c.Assert(err, IsNil)
-	err = readJSON(resp.Body, &stat)
+	stat := HotStoreStats{}
+	err := readJSON(s.urlPrefix+"/stores", &stat)
 	c.Assert(err, IsNil)
 }

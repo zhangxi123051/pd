@@ -16,13 +16,11 @@ package api
 import (
 	"fmt"
 	"time"
-
-	"github.com/juju/errors"
 )
 
 const (
-	//etcd peer detail API
-	//return struct https://github.com/coreos/etcd/blob/master/etcdserver/stats/server.go
+	// etcd peer detail API
+	// return struct https://github.com/etcd-io/etcd/blob/024f3dfc820e93e912c4b031b37edc66c5a0d72c/etcdserver/server.go#L1509
 	etcdPeerStatsAPI = "/v2/stats/self"
 )
 
@@ -43,13 +41,8 @@ type PeerStats struct {
 
 func getEtcdPeerStats(etcdClientURL string) (*PeerStats, error) {
 	ps := &PeerStats{}
-	resp, err := doGet(fmt.Sprintf("%s%s", etcdClientURL, etcdPeerStatsAPI))
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	defer resp.Body.Close()
-	if err := readJSON(resp.Body, ps); err != nil {
-		return nil, errors.Trace(err)
+	if err := readJSON(fmt.Sprintf("%s%s", etcdClientURL, etcdPeerStatsAPI), ps); err != nil {
+		return nil, err
 	}
 	return ps, nil
 }

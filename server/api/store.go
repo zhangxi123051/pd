@@ -20,11 +20,15 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
-	"github.com/juju/errors"
+	"github.com/pingcap/errcode"
 	"github.com/pingcap/kvproto/pkg/metapb"
-	"github.com/pingcap/pd/pkg/typeutil"
-	"github.com/pingcap/pd/server"
-	"github.com/pingcap/pd/server/core"
+	"github.com/pingcap/pd/v4/pkg/apiutil"
+	"github.com/pingcap/pd/v4/pkg/typeutil"
+	"github.com/pingcap/pd/v4/server"
+	"github.com/pingcap/pd/v4/server/config"
+	"github.com/pingcap/pd/v4/server/core"
+	"github.com/pingcap/pd/v4/server/schedule"
+	"github.com/pkg/errors"
 	"github.com/unrolled/render"
 )
 
@@ -36,16 +40,17 @@ type MetaStore struct {
 
 // StoreStatus contains status about a store.
 type StoreStatus struct {
-	Capacity           typeutil.ByteSize  `json:"capacity,omitempty"`
-	Available          typeutil.ByteSize  `json:"available,omitempty"`
-	LeaderCount        int                `json:"leader_count,omitempty"`
-	LeaderWeight       float64            `json:"leader_weight,omitempty"`
-	LeaderScore        float64            `json:"leader_score,omitempty"`
-	LeaderSize         int64              `json:"leader_size,omitempty"`
-	RegionCount        int                `json:"region_count,omitempty"`
-	RegionWeight       float64            `json:"region_weight,omitempty"`
-	RegionScore        float64            `json:"region_score,omitempty"`
-	RegionSize         int64              `json:"region_size,omitempty"`
+	Capacity           typeutil.ByteSize  `json:"capacity"`
+	Available          typeutil.ByteSize  `json:"available"`
+	UsedSize           typeutil.ByteSize  `json:"used_size"`
+	LeaderCount        int                `json:"leader_count"`
+	LeaderWeight       float64            `json:"leader_weight"`
+	LeaderScore        float64            `json:"leader_score"`
+	LeaderSize         int64              `json:"leader_size"`
+	RegionCount        int                `json:"region_count"`
+	RegionWeight       float64            `json:"region_weight"`
+	RegionScore        float64            `json:"region_score"`
+	RegionSize         int64              `json:"region_size"`
 	SendingSnapCount   uint32             `json:"sending_snap_count,omitempty"`
 	ReceivingSnapCount uint32             `json:"receiving_snap_count,omitempty"`
 	ApplyingSnapCount  uint32             `json:"applying_snap_count,omitempty"`
@@ -66,35 +71,36 @@ const (
 	downStateName    = "Down"
 )
 
-func newStoreInfo(opt *server.ScheduleConfig, store *core.StoreInfo) *StoreInfo {
+func newStoreInfo(opt *config.ScheduleConfig, store *core.StoreInfo) *StoreInfo {
 	s := &StoreInfo{
 		Store: &MetaStore{
-			Store:     store.Store,
-			StateName: store.State.String(),
+			Store:     store.GetMeta(),
+			StateName: store.GetState().String(),
 		},
 		Status: &StoreStatus{
-			Capacity:           typeutil.ByteSize(store.Stats.GetCapacity()),
-			Available:          typeutil.ByteSize(store.Stats.GetAvailable()),
-			LeaderCount:        store.LeaderCount,
-			LeaderWeight:       store.LeaderWeight,
-			LeaderScore:        store.LeaderScore(0),
-			LeaderSize:         store.LeaderSize,
-			RegionCount:        store.RegionCount,
-			RegionWeight:       store.RegionWeight,
+			Capacity:           typeutil.ByteSize(store.GetCapacity()),
+			Available:          typeutil.ByteSize(store.GetAvailable()),
+			UsedSize:           typeutil.ByteSize(store.GetUsedSize()),
+			LeaderCount:        store.GetLeaderCount(),
+			LeaderWeight:       store.GetLeaderWeight(),
+			LeaderScore:        store.LeaderScore(core.StringToSchedulePolicy(opt.LeaderSchedulePolicy), 0),
+			LeaderSize:         store.GetLeaderSize(),
+			RegionCount:        store.GetRegionCount(),
+			RegionWeight:       store.GetRegionWeight(),
 			RegionScore:        store.RegionScore(opt.HighSpaceRatio, opt.LowSpaceRatio, 0),
-			RegionSize:         store.RegionSize,
-			SendingSnapCount:   store.Stats.GetSendingSnapCount(),
-			ReceivingSnapCount: store.Stats.GetReceivingSnapCount(),
-			ApplyingSnapCount:  store.Stats.GetApplyingSnapCount(),
-			IsBusy:             store.Stats.GetIsBusy(),
+			RegionSize:         store.GetRegionSize(),
+			SendingSnapCount:   store.GetSendingSnapCount(),
+			ReceivingSnapCount: store.GetReceivingSnapCount(),
+			ApplyingSnapCount:  store.GetApplyingSnapCount(),
+			IsBusy:             store.IsBusy(),
 		},
 	}
 
-	if store.Stats != nil {
-		startTS := store.GetStartTS()
+	if store.GetStoreStats() != nil {
+		startTS := store.GetStartTime()
 		s.Status.StartTS = &startTS
 	}
-	if lastHeartbeat := store.LastHeartbeatTS; !lastHeartbeat.IsZero() {
+	if lastHeartbeat := store.GetLastHeartbeatTS(); !lastHeartbeat.IsZero() {
 		s.Status.LastHeartbeatTS = &lastHeartbeat
 	}
 	if upTime := store.GetUptime(); upTime > 0 {
@@ -102,7 +108,7 @@ func newStoreInfo(opt *server.ScheduleConfig, store *core.StoreInfo) *StoreInfo 
 		s.Status.Uptime = &duration
 	}
 
-	if store.State == metapb.StoreState_Up {
+	if store.GetState() == metapb.StoreState_Up {
 		if store.DownTime() > opt.MaxStoreDownTime.Duration {
 			s.Store.StateName = downStateName
 		} else if store.IsDisconnected() {
@@ -119,66 +125,55 @@ type StoresInfo struct {
 }
 
 type storeHandler struct {
-	svr *server.Server
-	rd  *render.Render
+	*server.Handler
+	rd *render.Render
 }
 
-func newStoreHandler(svr *server.Server, rd *render.Render) *storeHandler {
+func newStoreHandler(handler *server.Handler, rd *render.Render) *storeHandler {
 	return &storeHandler{
-		svr: svr,
-		rd:  rd,
+		Handler: handler,
+		rd:      rd,
 	}
 }
 
 func (h *storeHandler) Get(w http.ResponseWriter, r *http.Request) {
-	cluster := h.svr.GetRaftCluster()
-	if cluster == nil {
-		h.rd.JSON(w, http.StatusInternalServerError, server.ErrNotBootstrapped.Error())
-		return
-	}
-
+	rc := getCluster(r.Context())
 	vars := mux.Vars(r)
-	storeIDStr := vars["id"]
-	storeID, err := strconv.ParseUint(storeIDStr, 10, 64)
-	if err != nil {
-		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+	storeID, errParse := apiutil.ParseUint64VarsField(vars, "id")
+	if errParse != nil {
+		apiutil.ErrorResp(h.rd, w, errcode.NewInvalidInputErr(errParse))
 		return
 	}
 
-	store, err := cluster.GetStore(storeID)
-	if err != nil {
-		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+	store := rc.GetStore(storeID)
+	if store == nil {
+		h.rd.JSON(w, http.StatusInternalServerError, server.ErrStoreNotFound(storeID))
 		return
 	}
 
-	storeInfo := newStoreInfo(h.svr.GetScheduleConfig(), store)
+	storeInfo := newStoreInfo(h.GetScheduleConfig(), store)
 	h.rd.JSON(w, http.StatusOK, storeInfo)
 }
 
 func (h *storeHandler) Delete(w http.ResponseWriter, r *http.Request) {
-	cluster := h.svr.GetRaftCluster()
-	if cluster == nil {
-		h.rd.JSON(w, http.StatusInternalServerError, server.ErrNotBootstrapped.Error())
-		return
-	}
-
+	rc := getCluster(r.Context())
 	vars := mux.Vars(r)
-	storeIDStr := vars["id"]
-	storeID, err := strconv.ParseUint(storeIDStr, 10, 64)
-	if err != nil {
-		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+	storeID, errParse := apiutil.ParseUint64VarsField(vars, "id")
+	if errParse != nil {
+		apiutil.ErrorResp(h.rd, w, errcode.NewInvalidInputErr(errParse))
 		return
 	}
 
+	var err error
 	_, force := r.URL.Query()["force"]
 	if force {
-		err = cluster.BuryStore(storeID, force)
+		err = rc.BuryStore(storeID, force)
 	} else {
-		err = cluster.RemoveStore(storeID)
+		err = rc.RemoveStore(storeID)
 	}
 
 	if err != nil {
-		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+		apiutil.ErrorResp(h.rd, w, err)
 		return
 	}
 
@@ -186,17 +181,11 @@ func (h *storeHandler) Delete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *storeHandler) SetState(w http.ResponseWriter, r *http.Request) {
-	cluster := h.svr.GetRaftCluster()
-	if cluster == nil {
-		h.rd.JSON(w, http.StatusInternalServerError, server.ErrNotBootstrapped.Error())
-		return
-	}
-
+	rc := getCluster(r.Context())
 	vars := mux.Vars(r)
-	storeIDStr := vars["id"]
-	storeID, err := strconv.ParseUint(storeIDStr, 10, 64)
-	if err != nil {
-		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+	storeID, errParse := apiutil.ParseUint64VarsField(vars, "id")
+	if errParse != nil {
+		apiutil.ErrorResp(h.rd, w, errcode.NewInvalidInputErr(errParse))
 		return
 	}
 
@@ -207,7 +196,7 @@ func (h *storeHandler) SetState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = cluster.SetStoreState(storeID, metapb.StoreState(state))
+	err := rc.SetStoreState(storeID, metapb.StoreState(state))
 	if err != nil {
 		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
 		return
@@ -217,23 +206,16 @@ func (h *storeHandler) SetState(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *storeHandler) SetLabels(w http.ResponseWriter, r *http.Request) {
-	cluster := h.svr.GetRaftCluster()
-	if cluster == nil {
-		h.rd.JSON(w, http.StatusInternalServerError, server.ErrNotBootstrapped.Error())
-		return
-	}
-
+	rc := getCluster(r.Context())
 	vars := mux.Vars(r)
-	storeIDStr := vars["id"]
-	storeID, err := strconv.ParseUint(storeIDStr, 10, 64)
-	if err != nil {
-		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+	storeID, errParse := apiutil.ParseUint64VarsField(vars, "id")
+	if errParse != nil {
+		apiutil.ErrorResp(h.rd, w, errcode.NewInvalidInputErr(errParse))
 		return
 	}
 
 	var input map[string]string
-	if err := readJSON(r.Body, &input); err != nil {
-		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+	if err := apiutil.ReadJSONRespondError(h.rd, w, r.Body, &input); err != nil {
 		return
 	}
 
@@ -245,7 +227,13 @@ func (h *storeHandler) SetLabels(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	if err := cluster.UpdateStoreLabels(storeID, labels); err != nil {
+	if err := config.ValidateLabels(labels); err != nil {
+		apiutil.ErrorResp(h.rd, w, errcode.NewInvalidInputErr(err))
+		return
+	}
+
+	_, force := r.URL.Query()["force"]
+	if err := rc.UpdateStoreLabels(storeID, labels, force); err != nil {
 		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -254,23 +242,16 @@ func (h *storeHandler) SetLabels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *storeHandler) SetWeight(w http.ResponseWriter, r *http.Request) {
-	cluster := h.svr.GetRaftCluster()
-	if cluster == nil {
-		h.rd.JSON(w, http.StatusInternalServerError, server.ErrNotBootstrapped.Error())
-		return
-	}
-
+	rc := getCluster(r.Context())
 	vars := mux.Vars(r)
-	storeIDStr := vars["id"]
-	storeID, err := strconv.ParseUint(storeIDStr, 10, 64)
-	if err != nil {
-		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+	storeID, errParse := apiutil.ParseUint64VarsField(vars, "id")
+	if errParse != nil {
+		apiutil.ErrorResp(h.rd, w, errcode.NewInvalidInputErr(errParse))
 		return
 	}
 
 	var input map[string]interface{}
-	if err := readJSON(r.Body, &input); err != nil {
-		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+	if err := apiutil.ReadJSONRespondError(h.rd, w, r.Body, &input); err != nil {
 		return
 	}
 
@@ -295,7 +276,39 @@ func (h *storeHandler) SetWeight(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := cluster.SetStoreWeight(storeID, leader, region); err != nil {
+	if err := rc.SetStoreWeight(storeID, leader, region); err != nil {
+		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	h.rd.JSON(w, http.StatusOK, nil)
+}
+
+func (h *storeHandler) SetLimit(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	storeID, errParse := apiutil.ParseUint64VarsField(vars, "id")
+	if errParse != nil {
+		apiutil.ErrorResp(h.rd, w, errcode.NewInvalidInputErr(errParse))
+		return
+	}
+
+	var input map[string]interface{}
+	if err := apiutil.ReadJSONRespondError(h.rd, w, r.Body, &input); err != nil {
+		return
+	}
+
+	rateVal, ok := input["rate"]
+	if !ok {
+		h.rd.JSON(w, http.StatusBadRequest, "rate unset")
+		return
+	}
+	rate, ok := rateVal.(float64)
+	if !ok || rate < 0 {
+		h.rd.JSON(w, http.StatusBadRequest, "badformat rate")
+		return
+	}
+
+	if err := h.SetStoreLimit(storeID, rate/schedule.StoreBalanceBaseTime); err != nil {
 		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -304,25 +317,91 @@ func (h *storeHandler) SetWeight(w http.ResponseWriter, r *http.Request) {
 }
 
 type storesHandler struct {
-	svr *server.Server
-	rd  *render.Render
+	*server.Handler
+	rd *render.Render
 }
 
-func newStoresHandler(svr *server.Server, rd *render.Render) *storesHandler {
+func newStoresHandler(handler *server.Handler, rd *render.Render) *storesHandler {
 	return &storesHandler{
-		svr: svr,
-		rd:  rd,
+		Handler: handler,
+		rd:      rd,
 	}
 }
 
-func (h *storesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	cluster := h.svr.GetRaftCluster()
-	if cluster == nil {
-		h.rd.JSON(w, http.StatusInternalServerError, server.ErrNotBootstrapped.Error())
+func (h *storesHandler) RemoveTombStone(w http.ResponseWriter, r *http.Request) {
+	rc := getCluster(r.Context())
+	err := rc.RemoveTombStoneRecords()
+	if err != nil {
+		apiutil.ErrorResp(h.rd, w, err)
 		return
 	}
 
-	stores := cluster.GetStores()
+	h.rd.JSON(w, http.StatusOK, nil)
+}
+
+func (h *storesHandler) SetAllLimit(w http.ResponseWriter, r *http.Request) {
+	var input map[string]interface{}
+	if err := apiutil.ReadJSONRespondError(h.rd, w, r.Body, &input); err != nil {
+		return
+	}
+
+	rateVal, ok := input["rate"]
+	if !ok {
+		h.rd.JSON(w, http.StatusBadRequest, "rate unset")
+		return
+	}
+	rate, ok := rateVal.(float64)
+	if !ok || rate < 0 {
+		h.rd.JSON(w, http.StatusBadRequest, "badformat rate")
+		return
+	}
+
+	if err := h.SetAllStoresLimit(rate / schedule.StoreBalanceBaseTime); err != nil {
+		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	h.rd.JSON(w, http.StatusOK, nil)
+}
+
+func (h *storesHandler) GetAllLimit(w http.ResponseWriter, r *http.Request) {
+	limits, err := h.GetAllStoresLimit()
+	if err != nil {
+		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	type LimitResp struct {
+		Rate float64 `json:"rate"`
+		Mode string  `json:"mode"`
+	}
+	resp := make(map[uint64]*LimitResp)
+	for s, l := range limits {
+		resp[s] = &LimitResp{
+			Rate: l.Rate() * schedule.StoreBalanceBaseTime,
+			Mode: l.Mode().String(),
+		}
+	}
+
+	h.rd.JSON(w, http.StatusOK, resp)
+}
+
+func (h *storesHandler) SetStoreLimitScene(w http.ResponseWriter, r *http.Request) {
+	scene := h.Handler.GetStoreLimitScene()
+	if err := apiutil.ReadJSONRespondError(h.rd, w, r.Body, &scene); err != nil {
+		return
+	}
+	h.Handler.SetStoreLimitScene(scene)
+	h.rd.JSON(w, http.StatusOK, nil)
+}
+
+func (h *storesHandler) GetStoreLimitScene(w http.ResponseWriter, r *http.Request) {
+	scene := h.Handler.GetStoreLimitScene()
+	h.rd.JSON(w, http.StatusOK, scene)
+}
+
+func (h *storesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	rc := getCluster(r.Context())
+	stores := rc.GetMetaStores()
 	StoresInfo := &StoresInfo{
 		Stores: make([]*StoreInfo, 0, len(stores)),
 	}
@@ -333,15 +412,16 @@ func (h *storesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stores = urlFilter.filter(cluster.GetStores())
+	stores = urlFilter.filter(rc.GetMetaStores())
 	for _, s := range stores {
-		store, err := cluster.GetStore(s.GetId())
-		if err != nil {
-			h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+		storeID := s.GetId()
+		store := rc.GetStore(storeID)
+		if store == nil {
+			h.rd.JSON(w, http.StatusInternalServerError, server.ErrStoreNotFound(storeID))
 			return
 		}
 
-		storeInfo := newStoreInfo(h.svr.GetScheduleConfig(), store)
+		storeInfo := newStoreInfo(h.GetScheduleConfig(), store)
 		StoresInfo.Stores = append(StoresInfo.Stores, storeInfo)
 	}
 	StoresInfo.Count = len(StoresInfo.Stores)
@@ -359,7 +439,7 @@ func newStoreStateFilter(u *url.URL) (*storeStateFilter, error) {
 		for _, s := range v {
 			state, err := strconv.Atoi(s)
 			if err != nil {
-				return nil, errors.Trace(err)
+				return nil, errors.WithStack(err)
 			}
 
 			storeState := metapb.StoreState(state)

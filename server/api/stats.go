@@ -16,7 +16,7 @@ package api
 import (
 	"net/http"
 
-	"github.com/pingcap/pd/server"
+	"github.com/pingcap/pd/v4/server"
 	"github.com/unrolled/render"
 )
 
@@ -33,12 +33,8 @@ func newStatsHandler(svr *server.Server, rd *render.Render) *statsHandler {
 }
 
 func (h *statsHandler) Region(w http.ResponseWriter, r *http.Request) {
-	cluster := h.svr.GetRaftCluster()
-	if cluster == nil {
-		h.rd.JSON(w, http.StatusInternalServerError, server.ErrNotBootstrapped.Error())
-		return
-	}
+	rc := getCluster(r.Context())
 	startKey, endKey := r.URL.Query().Get("start_key"), r.URL.Query().Get("end_key")
-	stats := cluster.GetRegionStats([]byte(startKey), []byte(endKey))
+	stats := rc.GetRegionStats([]byte(startKey), []byte(endKey))
 	h.rd.JSON(w, http.StatusOK, stats)
 }

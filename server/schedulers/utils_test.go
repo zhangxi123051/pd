@@ -20,6 +20,11 @@ import (
 	. "github.com/pingcap/check"
 )
 
+const (
+	KB = 1024
+	MB = 1024 * KB
+)
+
 func TestSchedulers(t *testing.T) {
 	TestingT(t)
 }

@@ -31,13 +31,37 @@ var schedulerStatus = prometheus.NewGaugeVec(
 		Help:      "Inner status of the scheduler.",
 	}, []string{"type", "name"})
 
+var hotPeerSummary = prometheus.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Namespace: "pd",
+		Subsystem: "scheduler",
+		Name:      "hot_peers_summary",
+		Help:      "Hot peers summary for each store",
+	}, []string{"type", "store"})
+
+var opInfluenceStatus = prometheus.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Namespace: "pd",
+		Subsystem: "scheduler",
+		Name:      "op_influence",
+		Help:      "Store status for schedule",
+	}, []string{"scheduler", "store", "type"})
+
+var tolerantResourceStatus = prometheus.NewGaugeVec(
+	prometheus.GaugeOpts{
+		Namespace: "pd",
+		Subsystem: "scheduler",
+		Name:      "tolerant_resource",
+		Help:      "Store status for schedule",
+	}, []string{"scheduler", "source", "target"})
+
 var balanceLeaderCounter = prometheus.NewCounterVec(
 	prometheus.CounterOpts{
 		Namespace: "pd",
 		Subsystem: "scheduler",
 		Name:      "balance_leader",
 		Help:      "Counter of balance leader scheduler.",
-	}, []string{"type", "store"})
+	}, []string{"type", "address", "store"})
 
 var balanceRegionCounter = prometheus.NewCounterVec(
 	prometheus.CounterOpts{
@@ -45,11 +69,41 @@ var balanceRegionCounter = prometheus.NewCounterVec(
 		Subsystem: "scheduler",
 		Name:      "balance_region",
 		Help:      "Counter of balance region scheduler.",
-	}, []string{"type", "store"})
+	}, []string{"type", "address", "store"})
+
+var balanceDirectionCounter = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Namespace: "pd",
+		Subsystem: "scheduler",
+		Name:      "balance_direction",
+		Help:      "Counter of direction of balance related schedulers.",
+	}, []string{"type", "source", "target"})
+
+var scatterRangeLeaderCounter = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Namespace: "pd",
+		Subsystem: "scheduler",
+		Name:      "scatter_range_leader",
+		Help:      "Counter of scatter range leader scheduler.",
+	}, []string{"type", "address", "store"})
+
+var scatterRangeRegionCounter = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Namespace: "pd",
+		Subsystem: "scheduler",
+		Name:      "scatter_range_region",
+		Help:      "Counter of scatter range region scheduler.",
+	}, []string{"type", "address", "store"})
 
 func init() {
 	prometheus.MustRegister(schedulerCounter)
 	prometheus.MustRegister(schedulerStatus)
+	prometheus.MustRegister(hotPeerSummary)
 	prometheus.MustRegister(balanceLeaderCounter)
 	prometheus.MustRegister(balanceRegionCounter)
+	prometheus.MustRegister(balanceDirectionCounter)
+	prometheus.MustRegister(scatterRangeLeaderCounter)
+	prometheus.MustRegister(scatterRangeRegionCounter)
+	prometheus.MustRegister(opInfluenceStatus)
+	prometheus.MustRegister(tolerantResourceStatus)
 }

@@ -14,10 +14,13 @@
 package schedulers
 
 import (
+	"fmt"
+	"net/http"
 	"time"
 
-	"github.com/pingcap/pd/server/schedule"
-	log "github.com/sirupsen/logrus"
+	"github.com/pingcap/log"
+	"github.com/pingcap/pd/v4/server/schedule"
+	"github.com/pingcap/pd/v4/server/schedule/opt"
 )
 
 // options for interval of schedulers
@@ -32,41 +35,57 @@ const (
 type intervalGrowthType int
 
 const (
-	exponentailGrowth intervalGrowthType = iota
+	exponentialGrowth intervalGrowthType = iota
 	linearGrowth
 	zeroGrowth
 )
 
+// intervalGrow calculates the next interval of balance.
 func intervalGrow(x time.Duration, maxInterval time.Duration, typ intervalGrowthType) time.Duration {
 	switch typ {
-	case exponentailGrowth:
+	case exponentialGrowth:
 		return minDuration(time.Duration(float64(x)*ScheduleIntervalFactor), maxInterval)
 	case linearGrowth:
 		return minDuration(x+MinSlowScheduleInterval, maxInterval)
 	case zeroGrowth:
 		return x
 	default:
-		log.Fatal("unKnow interval growth type")
+		log.Fatal("unknown interval growth type")
 	}
 	return 0
 }
 
-type baseScheduler struct {
-	limiter *schedule.Limiter
+// BaseScheduler is a basic scheduler for all other complex scheduler
+type BaseScheduler struct {
+	OpController *schedule.OperatorController
 }
 
-func newBaseScheduler(limiter *schedule.Limiter) *baseScheduler {
-	return &baseScheduler{limiter: limiter}
+// NewBaseScheduler returns a basic scheduler
+func NewBaseScheduler(opController *schedule.OperatorController) *BaseScheduler {
+	return &BaseScheduler{OpController: opController}
 }
 
-func (s *baseScheduler) GetMinInterval() time.Duration {
+func (s *BaseScheduler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintf(w, "not implements")
+}
+
+// GetMinInterval returns the minimal interval for the scheduler
+func (s *BaseScheduler) GetMinInterval() time.Duration {
 	return MinScheduleInterval
 }
 
-func (s *baseScheduler) GetNextInterval(interval time.Duration) time.Duration {
-	return intervalGrow(interval, MaxScheduleInterval, exponentailGrowth)
+// EncodeConfig encode config for the scheduler
+func (s *BaseScheduler) EncodeConfig() ([]byte, error) {
+	return schedule.EncodeConfig(nil)
 }
 
-func (s *baseScheduler) Prepare(cluster schedule.Cluster) error { return nil }
+// GetNextInterval return the next interval for the scheduler
+func (s *BaseScheduler) GetNextInterval(interval time.Duration) time.Duration {
+	return intervalGrow(interval, MaxScheduleInterval, exponentialGrowth)
+}
 
-func (s *baseScheduler) Cleanup(cluster schedule.Cluster) {}
+// Prepare does some prepare work
+func (s *BaseScheduler) Prepare(cluster opt.Cluster) error { return nil }
+
+// Cleanup does some cleanup work
+func (s *BaseScheduler) Cleanup(cluster opt.Cluster) {}

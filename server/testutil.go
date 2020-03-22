@@ -17,48 +17,53 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
-	"os"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/coreos/etcd/embed"
-	"github.com/juju/errors"
-	"github.com/pingcap/pd/pkg/tempurl"
-	"github.com/pingcap/pd/pkg/typeutil"
-	// Register namespace classifiers.
-	_ "github.com/pingcap/pd/table"
+	"github.com/pingcap/check"
+	"github.com/pingcap/log"
+	"github.com/pingcap/pd/v4/pkg/tempurl"
+	"github.com/pingcap/pd/v4/pkg/testutil"
+	"github.com/pingcap/pd/v4/pkg/typeutil"
+	"github.com/pingcap/pd/v4/server/config"
+	"go.etcd.io/etcd/embed"
+
+	// Register schedulers
+	_ "github.com/pingcap/pd/v4/server/schedulers"
 )
 
 // CleanupFunc closes test pd server(s) and deletes any files left behind.
 type CleanupFunc func()
 
-func cleanServer(cfg *Config) {
-	// Clean data directory
-	os.RemoveAll(cfg.DataDir)
-}
-
 // NewTestServer creates a pd server for testing.
-func NewTestServer() (*Config, *Server, CleanupFunc, error) {
-	cfg := NewTestSingleConfig()
-	s, err := CreateServer(cfg, nil)
+func NewTestServer(c *check.C) (*Server, CleanupFunc, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cfg := NewTestSingleConfig(c)
+	s, err := CreateServer(ctx, cfg)
 	if err != nil {
-		return nil, nil, nil, errors.Trace(err)
+		cancel()
+		return nil, nil, err
 	}
-	if err = s.Run(context.TODO()); err != nil {
-		return nil, nil, nil, errors.Trace(err)
+	if err = s.Run(); err != nil {
+		cancel()
+		return nil, nil, err
 	}
 
 	cleanup := func() {
+		cancel()
 		s.Close()
-		cleanServer(cfg)
+		testutil.CleanServer(cfg.DataDir)
 	}
-	return cfg, s, cleanup, nil
+	return s, cleanup, nil
 }
 
+var zapLogOnce sync.Once
+
 // NewTestSingleConfig is only for test to create one pd.
-// Because pd-client also needs this, so export here.
-func NewTestSingleConfig() *Config {
-	cfg := &Config{
+// Because PD client also needs this, so export here.
+func NewTestSingleConfig(c *check.C) *config.Config {
+	cfg := &config.Config{
 		Name:       "pd",
 		ClientUrls: tempurl.Alloc(),
 		PeerUrls:   tempurl.Alloc(),
@@ -73,23 +78,29 @@ func NewTestSingleConfig() *Config {
 	cfg.AdvertisePeerUrls = cfg.PeerUrls
 	cfg.DataDir, _ = ioutil.TempDir("/tmp", "test_pd")
 	cfg.InitialCluster = fmt.Sprintf("pd=%s", cfg.PeerUrls)
-	cfg.disableStrictReconfigCheck = true
+	cfg.DisableStrictReconfigCheck = true
 	cfg.TickInterval = typeutil.NewDuration(100 * time.Millisecond)
-	cfg.ElectionInterval = typeutil.NewDuration(3000 * time.Millisecond)
-	cfg.leaderPriorityCheckInterval = typeutil.NewDuration(100 * time.Millisecond)
+	cfg.ElectionInterval = typeutil.NewDuration(3 * time.Second)
+	cfg.LeaderPriorityCheckInterval = typeutil.NewDuration(100 * time.Millisecond)
+	err := cfg.SetupLogger()
+	c.Assert(err, check.IsNil)
+	zapLogOnce.Do(func() {
+		log.ReplaceGlobals(cfg.GetZapLogger(), cfg.GetZapLogProperties())
+	})
 
-	cfg.adjust(nil)
+	c.Assert(cfg.Adjust(nil), check.IsNil)
+
 	return cfg
 }
 
 // NewTestMultiConfig is only for test to create multiple pd configurations.
-// Because pd-client also needs this, so export here.
-func NewTestMultiConfig(count int) []*Config {
-	cfgs := make([]*Config, count)
+// Because PD client also needs this, so export here.
+func NewTestMultiConfig(c *check.C, count int) []*config.Config {
+	cfgs := make([]*config.Config, count)
 
 	clusters := []string{}
 	for i := 1; i <= count; i++ {
-		cfg := NewTestSingleConfig()
+		cfg := NewTestSingleConfig(c)
 		cfg.Name = fmt.Sprintf("pd%d", i)
 
 		clusters = append(clusters, fmt.Sprintf("%s=%s", cfg.Name, cfg.PeerUrls))

@@ -18,10 +18,16 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/juju/errors"
-	"github.com/pingcap/pd/server/core"
-	"github.com/pingcap/pd/server/schedule"
-	log "github.com/sirupsen/logrus"
+	"github.com/pingcap/kvproto/pkg/metapb"
+	"github.com/pingcap/log"
+	"github.com/pingcap/pd/v4/server/core"
+	"github.com/pingcap/pd/v4/server/schedule"
+	"github.com/pingcap/pd/v4/server/schedule/filter"
+	"github.com/pingcap/pd/v4/server/schedule/operator"
+	"github.com/pingcap/pd/v4/server/schedule/opt"
+	"github.com/pingcap/pd/v4/server/schedule/selector"
+	"github.com/pkg/errors"
+	"go.uber.org/zap"
 )
 
 const (
@@ -30,23 +36,55 @@ const (
 	defaultAdjacentLeaderLimit   = 64
 	minAdjacentSchedulerInterval = time.Second
 	maxAdjacentSchedulerInterval = 30 * time.Second
+	// AdjacentRegionName is balance adjacent region scheduler name.
+	AdjacentRegionName = "balance-adjacent-region-scheduler"
+	// AdjacentRegionType is balance adjacent region scheduler type.
+	AdjacentRegionType = "adjacent-region"
 )
 
 func init() {
-	schedule.RegisterScheduler("adjacent-region", func(limiter *schedule.Limiter, args []string) (schedule.Scheduler, error) {
-		if len(args) == 2 {
-			leaderLimit, err := strconv.ParseUint(args[0], 10, 64)
-			if err != nil {
-				return nil, errors.Trace(err)
+	schedule.RegisterSliceDecoderBuilder(AdjacentRegionType, func(args []string) schedule.ConfigDecoder {
+		return func(v interface{}) error {
+			conf, ok := v.(*balanceAdjacentRegionConfig)
+			if !ok {
+				return ErrScheduleConfigNotExist
 			}
-			peerLimit, err := strconv.ParseUint(args[0], 10, 64)
-			if err != nil {
-				return nil, errors.Trace(err)
+			if len(args) == 2 {
+				leaderLimit, err := strconv.ParseUint(args[0], 10, 64)
+				if err != nil {
+					return errors.WithStack(err)
+				}
+				peerLimit, err := strconv.ParseUint(args[1], 10, 64)
+				if err != nil {
+					return errors.WithStack(err)
+				}
+				conf.LeaderLimit = leaderLimit
+				conf.PeerLimit = peerLimit
+				return nil
 			}
-			return newBalanceAdjacentRegionScheduler(limiter, leaderLimit, peerLimit), nil
+			conf.LeaderLimit = defaultAdjacentLeaderLimit
+			conf.PeerLimit = defaultAdjacentPeerLimit
+			conf.Name = AdjacentRegionName
+			return nil
 		}
-		return newBalanceAdjacentRegionScheduler(limiter), nil
 	})
+
+	schedule.RegisterScheduler(AdjacentRegionType, func(opController *schedule.OperatorController, storage *core.Storage, decoder schedule.ConfigDecoder) (schedule.Scheduler, error) {
+		conf := &balanceAdjacentRegionConfig{
+			LeaderLimit: defaultAdjacentLeaderLimit,
+			PeerLimit:   defaultAdjacentPeerLimit,
+		}
+		if err := decoder(conf); err != nil {
+			return nil, err
+		}
+		return newBalanceAdjacentRegionScheduler(opController, conf), nil
+	})
+}
+
+type balanceAdjacentRegionConfig struct {
+	Name        string `json:"name"`
+	LeaderLimit uint64 `json:"leader-limit"`
+	PeerLimit   uint64 `json:"peer-limit"`
 }
 
 // balanceAdjacentRegionScheduler will disperse adjacent regions.
@@ -55,12 +93,11 @@ func init() {
 // 1. any two adjacent regions' leader will not in the same store
 // 2. the two regions' leader will not in the public store of this two regions
 type balanceAdjacentRegionScheduler struct {
-	*baseScheduler
-	selector             schedule.Selector
-	leaderLimit          uint64
-	peerLimit            uint64
+	*BaseScheduler
+	selector             *selector.RandomSelector
 	lastKey              []byte
 	cacheRegions         *adjacentState
+	conf                 *balanceAdjacentRegionConfig
 	adjacentRegionsCount int
 }
 
@@ -82,36 +119,31 @@ func (a *adjacentState) len() int {
 
 // newBalanceAdjacentRegionScheduler creates a scheduler that tends to disperse adjacent region
 // on each store.
-func newBalanceAdjacentRegionScheduler(limiter *schedule.Limiter, args ...uint64) schedule.Scheduler {
-	filters := []schedule.Filter{
-		schedule.NewBlockFilter(),
-		schedule.NewStateFilter(),
-		schedule.NewHealthFilter(),
-		schedule.NewSnapshotCountFilter(),
-		schedule.NewPendingPeerCountFilter(),
-		schedule.NewRejectLeaderFilter(),
+func newBalanceAdjacentRegionScheduler(opController *schedule.OperatorController, conf *balanceAdjacentRegionConfig) schedule.Scheduler {
+	filters := []filter.Filter{
+		filter.StoreStateFilter{ActionScope: AdjacentRegionName, TransferLeader: true, MoveRegion: true},
+		filter.NewSpecialUseFilter(AdjacentRegionName),
 	}
-	base := newBaseScheduler(limiter)
+	base := NewBaseScheduler(opController)
 	s := &balanceAdjacentRegionScheduler{
-		baseScheduler: base,
-		selector:      schedule.NewRandomSelector(filters),
-		leaderLimit:   defaultAdjacentLeaderLimit,
-		peerLimit:     defaultAdjacentPeerLimit,
+		BaseScheduler: base,
+		selector:      selector.NewRandomSelector(filters),
+		conf:          conf,
 		lastKey:       []byte(""),
-	}
-	if len(args) == 2 {
-		s.leaderLimit = args[0]
-		s.peerLimit = args[1]
 	}
 	return s
 }
 
 func (l *balanceAdjacentRegionScheduler) GetName() string {
-	return "balance-adjacent-region-scheduler"
+	return l.conf.Name
 }
 
 func (l *balanceAdjacentRegionScheduler) GetType() string {
-	return "adjacent-region"
+	return AdjacentRegionType
+}
+
+func (l *balanceAdjacentRegionScheduler) EncodeConfig() ([]byte, error) {
+	return schedule.EncodeConfig(l.conf)
 }
 
 func (l *balanceAdjacentRegionScheduler) GetMinInterval() time.Duration {
@@ -122,19 +154,19 @@ func (l *balanceAdjacentRegionScheduler) GetNextInterval(interval time.Duration)
 	return intervalGrow(interval, maxAdjacentSchedulerInterval, linearGrowth)
 }
 
-func (l *balanceAdjacentRegionScheduler) IsScheduleAllowed(cluster schedule.Cluster) bool {
-	return l.allowBalanceLeader() || l.allowBalanceLeader()
+func (l *balanceAdjacentRegionScheduler) IsScheduleAllowed(cluster opt.Cluster) bool {
+	return l.allowBalanceLeader() || l.allowBalancePeer()
 }
 
 func (l *balanceAdjacentRegionScheduler) allowBalanceLeader() bool {
-	return l.limiter.OperatorCount(schedule.OpAdjacent|schedule.OpLeader) < l.leaderLimit
+	return l.OpController.OperatorCount(operator.OpAdjacent|operator.OpLeader) < l.conf.LeaderLimit
 }
 
 func (l *balanceAdjacentRegionScheduler) allowBalancePeer() bool {
-	return l.limiter.OperatorCount(schedule.OpAdjacent|schedule.OpRegion) < l.peerLimit
+	return l.OpController.OperatorCount(operator.OpAdjacent|operator.OpRegion) < l.conf.PeerLimit
 }
 
-func (l *balanceAdjacentRegionScheduler) Schedule(cluster schedule.Cluster, opInfluence schedule.OpInfluence) []*schedule.Operator {
+func (l *balanceAdjacentRegionScheduler) Schedule(cluster opt.Cluster) []*operator.Operator {
 	if l.cacheRegions == nil {
 		l.cacheRegions = &adjacentState{
 			assignedStoreIds: make([]uint64, 0, len(cluster.GetStores())),
@@ -148,11 +180,11 @@ func (l *balanceAdjacentRegionScheduler) Schedule(cluster schedule.Cluster, opIn
 	}
 
 	l.cacheRegions.clear()
-	regions := cluster.ScanRegions(l.lastKey, scanLimit)
+	regions := cluster.ScanRegions(l.lastKey, nil, scanLimit)
 	// scan to the end
 	if len(regions) <= 1 {
+		schedulerStatus.WithLabelValues(l.GetName(), "adjacent-count").Set(float64(l.adjacentRegionsCount))
 		l.adjacentRegionsCount = 0
-		schedulerStatus.WithLabelValues(l.GetName(), "adjacent_count").Set(float64(l.adjacentRegionsCount))
 		l.lastKey = []byte("")
 		return nil
 	}
@@ -162,11 +194,11 @@ func (l *balanceAdjacentRegionScheduler) Schedule(cluster schedule.Cluster, opIn
 	adjacentRegions = append(adjacentRegions, regions[0])
 	maxLen := 0
 	for i, r := range regions[1:] {
-		l.lastKey = r.StartKey
+		l.lastKey = r.GetStartKey()
 
 		// append if the region are adjacent
 		lastRegion := adjacentRegions[len(adjacentRegions)-1]
-		if lastRegion.Leader.GetStoreId() == r.Leader.GetStoreId() && bytes.Equal(lastRegion.EndKey, r.StartKey) {
+		if lastRegion.GetLeader().GetStoreId() == r.GetLeader().GetStoreId() && bytes.Equal(lastRegion.GetEndKey(), r.GetStartKey()) {
 			adjacentRegions = append(adjacentRegions, r)
 			if i != len(regions)-2 { // not the last element
 				continue
@@ -191,7 +223,7 @@ func (l *balanceAdjacentRegionScheduler) Schedule(cluster schedule.Cluster, opIn
 	return l.process(cluster)
 }
 
-func (l *balanceAdjacentRegionScheduler) process(cluster schedule.Cluster) []*schedule.Operator {
+func (l *balanceAdjacentRegionScheduler) process(cluster opt.Cluster) []*operator.Operator {
 	if l.cacheRegions.len() < 2 {
 		return nil
 	}
@@ -201,45 +233,54 @@ func (l *balanceAdjacentRegionScheduler) process(cluster schedule.Cluster) []*sc
 
 	defer func() {
 		if l.cacheRegions.len() < 0 {
-			log.Fatalf("[%s]the cache overflow should never happen", l.GetName())
+			log.Fatal("cache overflow", zap.String("scheduler", l.GetName()))
 		}
 		l.cacheRegions.head = head + 1
-		l.lastKey = r2.StartKey
+		l.lastKey = r2.GetStartKey()
 	}()
-	if l.unsafeToBalance(cluster, r1) {
+	// after the cluster is prepared, there is a gap that some regions heartbeats are not received.
+	// Leader of those region is nil, and we should skip them.
+	if r1.GetLeader() == nil || r2.GetLeader() == nil || l.unsafeToBalance(cluster, r1) {
 		schedulerCounter.WithLabelValues(l.GetName(), "skip").Inc()
 		return nil
 	}
 	op := l.disperseLeader(cluster, r1, r2)
 	if op == nil {
-		schedulerCounter.WithLabelValues(l.GetName(), "no_leader").Inc()
+		schedulerCounter.WithLabelValues(l.GetName(), "no-leader").Inc()
 		op = l.dispersePeer(cluster, r1)
 	}
 	if op == nil {
-		schedulerCounter.WithLabelValues(l.GetName(), "no_peer").Inc()
+		schedulerCounter.WithLabelValues(l.GetName(), "no-peer").Inc()
 		l.cacheRegions.assignedStoreIds = l.cacheRegions.assignedStoreIds[:0]
+		return nil
 	}
-	return []*schedule.Operator{op}
+	op.Counters = append(op.Counters, schedulerCounter.WithLabelValues(l.GetName(), "new-operator"))
+	return []*operator.Operator{op}
 }
 
-func (l *balanceAdjacentRegionScheduler) unsafeToBalance(cluster schedule.Cluster, region *core.RegionInfo) bool {
-	if len(region.GetPeers()) != cluster.GetMaxReplicas() {
+func (l *balanceAdjacentRegionScheduler) unsafeToBalance(cluster opt.Cluster, region *core.RegionInfo) bool {
+	if !opt.IsRegionReplicated(cluster, region) {
 		return true
 	}
-	store := cluster.GetStore(region.Leader.GetStoreId())
+	storeID := region.GetLeader().GetStoreId()
+	store := cluster.GetStore(storeID)
+	if store == nil {
+		log.Error("failed to get the store", zap.Uint64("store-id", storeID))
+		return true
+	}
 	s := l.selector.SelectSource(cluster, []*core.StoreInfo{store})
 	if s == nil {
 		return true
 	}
 	// Skip hot regions.
-	if cluster.IsRegionHot(region.GetId()) {
-		schedulerCounter.WithLabelValues(l.GetName(), "region_hot").Inc()
+	if cluster.IsRegionHot(region) {
+		schedulerCounter.WithLabelValues(l.GetName(), "region-hot").Inc()
 		return true
 	}
 	return false
 }
 
-func (l *balanceAdjacentRegionScheduler) disperseLeader(cluster schedule.Cluster, before *core.RegionInfo, after *core.RegionInfo) *schedule.Operator {
+func (l *balanceAdjacentRegionScheduler) disperseLeader(cluster opt.Cluster, before *core.RegionInfo, after *core.RegionInfo) *operator.Operator {
 	if !l.allowBalanceLeader() {
 		return nil
 	}
@@ -249,28 +290,42 @@ func (l *balanceAdjacentRegionScheduler) disperseLeader(cluster schedule.Cluster
 	}
 	storesInfo := make([]*core.StoreInfo, 0, len(diffPeers))
 	for _, p := range diffPeers {
-		storesInfo = append(storesInfo, cluster.GetStore(p.GetStoreId()))
+		if store := cluster.GetStore(p.GetStoreId()); store != nil {
+			storesInfo = append(storesInfo, store)
+		}
 	}
 	target := l.selector.SelectTarget(cluster, storesInfo)
 	if target == nil {
 		return nil
 	}
-	step := schedule.TransferLeader{FromStore: before.Leader.GetStoreId(), ToStore: target.GetId()}
-	op := schedule.NewOperator("balance-adjacent-leader", before.GetId(), before.GetRegionEpoch(), schedule.OpAdjacent|schedule.OpLeader, step)
+	op, err := operator.CreateTransferLeaderOperator("balance-adjacent-leader", cluster, before, before.GetLeader().GetStoreId(), target.GetID(), operator.OpAdjacent)
+	if err != nil {
+		log.Debug("fail to create transfer leader operator", zap.Error(err))
+		return nil
+	}
 	op.SetPriorityLevel(core.LowPriority)
-	schedulerCounter.WithLabelValues(l.GetName(), "adjacent_leader").Inc()
+	schedulerCounter.WithLabelValues(l.GetName(), "adjacent-leader").Inc()
 	return op
 }
 
-func (l *balanceAdjacentRegionScheduler) dispersePeer(cluster schedule.Cluster, region *core.RegionInfo) *schedule.Operator {
+func (l *balanceAdjacentRegionScheduler) dispersePeer(cluster opt.Cluster, region *core.RegionInfo) *operator.Operator {
 	if !l.allowBalancePeer() {
 		return nil
 	}
 	// scoreGuard guarantees that the distinct score will not decrease.
-	leaderStoreID := region.Leader.GetStoreId()
+	leaderStoreID := region.GetLeader().GetStoreId()
 	stores := cluster.GetRegionStores(region)
 	source := cluster.GetStore(leaderStoreID)
-	scoreGuard := schedule.NewDistinctScoreFilter(cluster.GetLocationLabels(), stores, source)
+	if source == nil {
+		log.Error("failed to get the source store", zap.Uint64("store-id", leaderStoreID))
+		return nil
+	}
+	var scoreGuard filter.Filter
+	if cluster.IsPlacementRulesEnabled() {
+		scoreGuard = filter.NewRuleFitFilter(l.GetName(), cluster, region, leaderStoreID)
+	} else {
+		scoreGuard = filter.NewDistinctScoreFilter(l.GetName(), cluster.GetLocationLabels(), stores, source)
+	}
 	excludeStores := region.GetStoreIds()
 	for _, storeID := range l.cacheRegions.assignedStoreIds {
 		if _, ok := excludeStores[storeID]; !ok {
@@ -278,28 +333,24 @@ func (l *balanceAdjacentRegionScheduler) dispersePeer(cluster schedule.Cluster, 
 		}
 	}
 
-	filters := []schedule.Filter{
-		schedule.NewExcludedFilter(nil, excludeStores),
+	filters := []filter.Filter{
+		filter.NewExcludedFilter(l.GetName(), nil, excludeStores),
 		scoreGuard,
 	}
 	target := l.selector.SelectTarget(cluster, cluster.GetStores(), filters...)
 	if target == nil {
 		return nil
 	}
-	newPeer, err := cluster.AllocPeer(target.GetId())
-	if err != nil {
-		return nil
-	}
-	if newPeer == nil {
-		schedulerCounter.WithLabelValues(l.GetName(), "no_peer").Inc()
-		return nil
-	}
-
+	newPeer := &metapb.Peer{StoreId: target.GetID()}
 	// record the store id and exclude it in next time
 	l.cacheRegions.assignedStoreIds = append(l.cacheRegions.assignedStoreIds, newPeer.GetStoreId())
 
-	op := schedule.CreateMovePeerOperator("balance-adjacent-peer", cluster, region, schedule.OpAdjacent, leaderStoreID, newPeer.GetStoreId(), newPeer.GetId())
+	op, err := operator.CreateMovePeerOperator("balance-adjacent-peer", cluster, region, operator.OpAdjacent, leaderStoreID, newPeer)
+	if err != nil {
+		schedulerCounter.WithLabelValues(l.GetName(), "create-operator-fail").Inc()
+		return nil
+	}
 	op.SetPriorityLevel(core.LowPriority)
-	schedulerCounter.WithLabelValues(l.GetName(), "adjacent_peer").Inc()
+	schedulerCounter.WithLabelValues(l.GetName(), "adjacent-peer").Inc()
 	return op
 }

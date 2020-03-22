@@ -14,10 +14,16 @@
 package core
 
 import (
+	"fmt"
+	"math/rand"
+	"strconv"
+	"strings"
 	"testing"
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/kvproto/pkg/metapb"
+	"github.com/pingcap/pd/v4/pkg/mock/mockid"
+	"github.com/pingcap/pd/v4/server/id"
 )
 
 func TestCore(t *testing.T) {
@@ -56,22 +62,18 @@ func (s *testRegionMapSuite) TestRegionMap(c *C) {
 
 func (s *testRegionMapSuite) regionInfo(id uint64) *RegionInfo {
 	return &RegionInfo{
-		Region: &metapb.Region{
+		meta: &metapb.Region{
 			Id: id,
 		},
-		ApproximateSize: int64(id),
-		ApproximateRows: int64(id),
+		approximateSize: int64(id),
+		approximateKeys: int64(id),
 	}
 }
 
 func (s *testRegionMapSuite) check(c *C, rm *regionMap, ids ...uint64) {
-	// Check position.
-	for _, r := range rm.m {
-		c.Assert(rm.ids[r.pos], Equals, r.Id)
-	}
 	// Check Get.
 	for _, id := range ids {
-		c.Assert(rm.Get(id).Id, Equals, id)
+		c.Assert(rm.Get(id).GetID(), Equals, id)
 	}
 	// Check Len.
 	c.Assert(rm.Len(), Equals, len(ids))
@@ -82,18 +84,116 @@ func (s *testRegionMapSuite) check(c *C, rm *regionMap, ids ...uint64) {
 	}
 	set1 := make(map[uint64]struct{})
 	for _, r := range rm.m {
-		set1[r.Id] = struct{}{}
-	}
-	set2 := make(map[uint64]struct{})
-	for _, id := range rm.ids {
-		set2[id] = struct{}{}
+		set1[r.GetID()] = struct{}{}
 	}
 	c.Assert(set1, DeepEquals, expect)
-	c.Assert(set2, DeepEquals, expect)
 	// Check region size.
 	var total int64
 	for _, id := range ids {
 		total += int64(id)
 	}
 	c.Assert(rm.TotalSize(), Equals, total)
+}
+
+var _ = Suite(&testRegionKey{})
+
+type testRegionKey struct{}
+
+func (*testRegionKey) TestRegionKey(c *C) {
+	testCase := []struct {
+		key    string
+		expect string
+	}{
+		{`"t\x80\x00\x00\x00\x00\x00\x00\xff!_r\x80\x00\x00\x00\x00\xff\x02\u007fY\x00\x00\x00\x00\x00\xfa"`,
+			`7480000000000000FF215F728000000000FF027F590000000000FA`},
+		{"\"\\x80\\x00\\x00\\x00\\x00\\x00\\x00\\xff\\x05\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\xf8\"",
+			`80000000000000FF0500000000000000F8`},
+	}
+	for _, t := range testCase {
+		got, err := strconv.Unquote(t.key)
+		c.Assert(err, IsNil)
+		s := fmt.Sprintln(RegionToHexMeta(&metapb.Region{StartKey: []byte(got)}))
+		c.Assert(strings.Contains(s, t.expect), IsTrue)
+
+		// start key changed
+		orgion := NewRegionInfo(&metapb.Region{EndKey: []byte(got)}, nil)
+		region := NewRegionInfo(&metapb.Region{StartKey: []byte(got), EndKey: []byte(got)}, nil)
+		s = DiffRegionKeyInfo(orgion, region)
+		c.Assert(s, Matches, ".*StartKey Changed.*")
+		c.Assert(strings.Contains(s, t.expect), IsTrue)
+
+		// end key changed
+		orgion = NewRegionInfo(&metapb.Region{StartKey: []byte(got)}, nil)
+		region = NewRegionInfo(&metapb.Region{StartKey: []byte(got), EndKey: []byte(got)}, nil)
+		s = DiffRegionKeyInfo(orgion, region)
+		c.Assert(s, Matches, ".*EndKey Changed.*")
+		c.Assert(strings.Contains(s, t.expect), IsTrue)
+	}
+}
+
+func BenchmarkRandomRegion(b *testing.B) {
+	regions := NewRegionsInfo()
+	for i := 0; i < 5000000; i++ {
+		peer := &metapb.Peer{StoreId: 1, Id: uint64(i + 1)}
+		region := NewRegionInfo(&metapb.Region{
+			Id:       uint64(i + 1),
+			Peers:    []*metapb.Peer{peer},
+			StartKey: []byte(fmt.Sprintf("%20d", i)),
+			EndKey:   []byte(fmt.Sprintf("%20d", i+1)),
+		}, peer)
+		regions.AddRegion(region)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		regions.RandLeaderRegion(1, nil)
+	}
+}
+
+const keyLength = 100
+
+func randomBytes(n int) []byte {
+	bytes := make([]byte, n)
+	_, err := rand.Read(bytes)
+	if err != nil {
+		panic(err)
+	}
+	return bytes
+}
+
+func newRegionInfoID(idAllocator id.Allocator) *RegionInfo {
+	var (
+		peers  []*metapb.Peer
+		leader *metapb.Peer
+	)
+	for i := 0; i < 3; i++ {
+		id, _ := idAllocator.Alloc()
+		p := &metapb.Peer{Id: id, StoreId: id}
+		if i == 0 {
+			leader = p
+		}
+		peers = append(peers, p)
+	}
+	regionID, _ := idAllocator.Alloc()
+	return NewRegionInfo(
+		&metapb.Region{
+			Id:       regionID,
+			StartKey: randomBytes(keyLength),
+			EndKey:   randomBytes(keyLength),
+			Peers:    peers,
+		},
+		leader,
+	)
+}
+
+func BenchmarkAddRegion(b *testing.B) {
+	regions := NewRegionsInfo()
+	idAllocator := mockid.NewIDAllocator()
+	var items []*RegionInfo
+	for i := 0; i < 10000000; i++ {
+		items = append(items, newRegionInfoID(idAllocator))
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		regions.AddRegion(items[i])
+	}
 }

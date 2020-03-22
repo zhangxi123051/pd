@@ -17,10 +17,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/juju/errors"
+	"github.com/pkg/errors"
 )
 
-//StringSlice is more friendly to json encode/decode
+// StringSlice is more friendly to json encode/decode
 type StringSlice []string
 
 // MarshalJSON returns the size as a JSON string.
@@ -32,10 +32,10 @@ func (s StringSlice) MarshalJSON() ([]byte, error) {
 func (s *StringSlice) UnmarshalJSON(text []byte) error {
 	data, err := strconv.Unquote(string(text))
 	if err != nil {
-		return errors.Trace(err)
+		return errors.WithStack(err)
 	}
 	if len(data) == 0 {
-		*s = nil
+		*s = []string{}
 		return nil
 	}
 	*s = strings.Split(data, ",")

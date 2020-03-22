@@ -20,11 +20,14 @@ import (
 	"strconv"
 
 	"github.com/gorilla/mux"
-	"github.com/juju/errors"
 	"github.com/pingcap/kvproto/pkg/pdpb"
-	"github.com/pingcap/pd/pkg/etcdutil"
-	"github.com/pingcap/pd/server"
+	"github.com/pingcap/log"
+	"github.com/pingcap/pd/v4/pkg/apiutil"
+	"github.com/pingcap/pd/v4/pkg/etcdutil"
+	"github.com/pingcap/pd/v4/server"
+	"github.com/pkg/errors"
 	"github.com/unrolled/render"
+	"go.uber.org/zap"
 )
 
 type memberHandler struct {
@@ -40,7 +43,7 @@ func newMemberHandler(svr *server.Server, rd *render.Render) *memberHandler {
 }
 
 func (h *memberHandler) ListMembers(w http.ResponseWriter, r *http.Request) {
-	members, err := h.listMembers()
+	members, err := h.getMembers()
 	if err != nil {
 		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
 		return
@@ -48,10 +51,35 @@ func (h *memberHandler) ListMembers(w http.ResponseWriter, r *http.Request) {
 	h.rd.JSON(w, http.StatusOK, members)
 }
 
-func (h *memberHandler) listMembers() (*pdpb.GetMembersResponse, error) {
+func (h *memberHandler) getMembers() (*pdpb.GetMembersResponse, error) {
 	req := &pdpb.GetMembersRequest{Header: &pdpb.RequestHeader{ClusterId: h.svr.ClusterID()}}
 	members, err := h.svr.GetMembers(context.Background(), req)
-	return members, errors.Trace(err)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	for _, m := range members.GetMembers() {
+		binaryVersion, e := h.svr.GetMember().GetMemberBinaryVersion(m.GetMemberId())
+		if e != nil {
+			log.Error("failed to load binary version", zap.Uint64("member", m.GetMemberId()), zap.Error(err))
+		}
+		m.BinaryVersion = binaryVersion
+		deployPath, e := h.svr.GetMember().GetMemberDeployPath(m.GetMemberId())
+		if e != nil {
+			log.Error("failed to load deploy path", zap.Uint64("member", m.GetMemberId()), zap.Error(err))
+		}
+		m.DeployPath = deployPath
+		if h.svr.GetMember().GetEtcdLeader() == 0 {
+			log.Warn("no etcd leader, skip get leader priority", zap.Uint64("member", m.GetMemberId()))
+			continue
+		}
+		leaderPriority, e := h.svr.GetMember().GetMemberLeaderPriority(m.GetMemberId())
+		if e != nil {
+			log.Error("failed to load leader priority", zap.Uint64("member", m.GetMemberId()), zap.Error(err))
+			continue
+		}
+		m.LeaderPriority = int32(leaderPriority)
+	}
+	return members, nil
 }
 
 func (h *memberHandler) DeleteByName(w http.ResponseWriter, r *http.Request) {
@@ -77,7 +105,7 @@ func (h *memberHandler) DeleteByName(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Delete config.
-	err = h.svr.DeleteMemberLeaderPriority(id)
+	err = h.svr.GetMember().DeleteMemberLeaderPriority(id)
 	if err != nil {
 		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
 		return
@@ -96,12 +124,12 @@ func (h *memberHandler) DeleteByID(w http.ResponseWriter, r *http.Request) {
 	idStr := mux.Vars(r)["id"]
 	id, err := strconv.ParseUint(idStr, 10, 64)
 	if err != nil {
-		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+		h.rd.JSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	// Delete config.
-	err = h.svr.DeleteMemberLeaderPriority(id)
+	err = h.svr.GetMember().DeleteMemberLeaderPriority(id)
 	if err != nil {
 		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
 		return
@@ -117,9 +145,9 @@ func (h *memberHandler) DeleteByID(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *memberHandler) SetMemberPropertyByName(w http.ResponseWriter, r *http.Request) {
-	members, err := h.listMembers()
-	if err != nil {
-		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+	members, membersErr := h.getMembers()
+	if membersErr != nil {
+		h.rd.JSON(w, http.StatusInternalServerError, membersErr.Error())
 		return
 	}
 
@@ -137,8 +165,7 @@ func (h *memberHandler) SetMemberPropertyByName(w http.ResponseWriter, r *http.R
 	}
 
 	var input map[string]interface{}
-	if err = readJSON(r.Body, &input); err != nil {
-		h.rd.JSON(w, http.StatusBadRequest, err.Error())
+	if err := apiutil.ReadJSONRespondError(h.rd, w, r.Body, &input); err != nil {
 		return
 	}
 	for k, v := range input {
@@ -149,7 +176,7 @@ func (h *memberHandler) SetMemberPropertyByName(w http.ResponseWriter, r *http.R
 				h.rd.JSON(w, http.StatusBadRequest, "bad format leader priority")
 				return
 			}
-			err = h.svr.SetMemberLeaderPriority(memberID, int(priority))
+			err := h.svr.GetMember().SetMemberLeaderPriority(memberID, int(priority))
 			if err != nil {
 				h.rd.JSON(w, http.StatusInternalServerError, err.Error())
 				return
@@ -172,17 +199,11 @@ func newLeaderHandler(svr *server.Server, rd *render.Render) *leaderHandler {
 }
 
 func (h *leaderHandler) Get(w http.ResponseWriter, r *http.Request) {
-	leader, err := h.svr.GetLeader()
-	if err != nil {
-		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	h.rd.JSON(w, http.StatusOK, leader)
+	h.rd.JSON(w, http.StatusOK, h.svr.GetLeader())
 }
 
 func (h *leaderHandler) Resign(w http.ResponseWriter, r *http.Request) {
-	err := h.svr.ResignLeader("")
+	err := h.svr.GetMember().ResignLeader(h.svr.Context(), h.svr.Name(), "")
 	if err != nil {
 		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
 		return
@@ -192,7 +213,7 @@ func (h *leaderHandler) Resign(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *leaderHandler) Transfer(w http.ResponseWriter, r *http.Request) {
-	err := h.svr.ResignLeader(mux.Vars(r)["next_leader"])
+	err := h.svr.GetMember().ResignLeader(h.svr.Context(), h.svr.Name(), mux.Vars(r)["next_leader"])
 	if err != nil {
 		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
 		return

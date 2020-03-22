@@ -15,23 +15,27 @@ package server
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"math/rand"
 	"net/http"
+	"path"
 	"time"
 
-	"github.com/coreos/etcd/clientv3"
-	"github.com/golang/protobuf/proto"
-	"github.com/juju/errors"
+	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/kvproto/pkg/pdpb"
-	"github.com/pingcap/pd/pkg/etcdutil"
-	log "github.com/sirupsen/logrus"
+	"github.com/pingcap/log"
+	"github.com/pingcap/pd/v4/pkg/etcdutil"
+	"github.com/pingcap/pd/v4/pkg/typeutil"
+	"github.com/pingcap/pd/v4/server/cluster"
+	"github.com/pingcap/pd/v4/server/config"
+	"github.com/pkg/errors"
+	"go.etcd.io/etcd/clientv3"
+	"go.uber.org/zap"
 )
 
 const (
-	requestTimeout  = etcdutil.DefaultRequestTimeout
-	slowRequestTime = etcdutil.DefaultSlowRequestTime
+	clientTimeout  = 3 * time.Second
+	requestTimeout = etcdutil.DefaultRequestTimeout
 )
 
 // Version information.
@@ -42,20 +46,13 @@ var (
 	PDGitBranch      = "None"
 )
 
-// DialClient used to dail http request.
-var DialClient = &http.Client{
-	Transport: &http.Transport{
-		DisableKeepAlives: true,
-	},
-}
-
 // LogPDInfo prints the PD version information.
 func LogPDInfo() {
-	log.Infof("Welcome to Placement Driver (PD).")
-	log.Infof("Release Version: %s", PDReleaseVersion)
-	log.Infof("Git Commit Hash: %s", PDGitHash)
-	log.Infof("Git Branch: %s", PDGitBranch)
-	log.Infof("UTC Build Time:  %s", PDBuildTS)
+	log.Info("Welcome to Placement Driver (PD)")
+	log.Info("PD", zap.String("release-version", PDReleaseVersion))
+	log.Info("PD", zap.String("git-hash", PDGitHash))
+	log.Info("PD", zap.String("git-branch", PDGitBranch))
+	log.Info("PD", zap.String("utc-build-time", PDBuildTS))
 }
 
 // PrintPDInfo prints the PD version information without log info.
@@ -66,39 +63,32 @@ func PrintPDInfo() {
 	fmt.Println("UTC Build Time: ", PDBuildTS)
 }
 
-// A helper function to get value with key from etcd.
-// TODO: return the value revision for outer use.
-func getValue(c *clientv3.Client, key string, opts ...clientv3.OpOption) ([]byte, error) {
-	resp, err := kvGet(c, key, opts...)
-	if err != nil {
-		return nil, errors.Trace(err)
+// PrintConfigCheckMsg prints the message about configuration checks.
+func PrintConfigCheckMsg(cfg *config.Config) {
+	if len(cfg.WarningMsgs) == 0 {
+		fmt.Println("config check successful")
+		return
 	}
 
-	if n := len(resp.Kvs); n == 0 {
-		return nil, nil
-	} else if n > 1 {
-		return nil, errors.Errorf("invalid get value resp %v, must only one", resp.Kvs)
+	for _, msg := range cfg.WarningMsgs {
+		fmt.Println(msg)
 	}
-
-	return resp.Kvs[0].Value, nil
 }
 
-// Return boolean to indicate whether the key exists or not.
-// TODO: return the value revision for outer use.
-func getProtoMsg(c *clientv3.Client, key string, msg proto.Message, opts ...clientv3.OpOption) (bool, error) {
-	value, err := getValue(c, key, opts...)
-	if err != nil {
-		return false, errors.Trace(err)
+// CheckPDVersion checks if PD needs to be upgraded.
+func CheckPDVersion(opt *config.ScheduleOption) {
+	pdVersion := *cluster.MinSupportedVersion(cluster.Base)
+	if PDReleaseVersion != "None" {
+		pdVersion = *cluster.MustParseVersion(PDReleaseVersion)
 	}
-	if value == nil {
-		return false, nil
+	clusterVersion := *opt.LoadClusterVersion()
+	log.Info("load cluster version", zap.Stringer("cluster-version", clusterVersion))
+	if pdVersion.LessThan(clusterVersion) {
+		log.Warn(
+			"PD version less than cluster version, please upgrade PD",
+			zap.String("PD-version", pdVersion.String()),
+			zap.String("cluster-version", clusterVersion.String()))
 	}
-
-	if err = proto.Unmarshal(value, msg); err != nil {
-		return false, errors.Trace(err)
-	}
-
-	return true, nil
 }
 
 func initOrGetClusterID(c *clientv3.Client, key string) (uint64, error) {
@@ -108,7 +98,7 @@ func initOrGetClusterID(c *clientv3.Client, key string) (uint64, error) {
 	// Generate a random cluster ID.
 	ts := uint64(time.Now().Unix())
 	clusterID := (ts << 32) + uint64(rand.Uint32())
-	value := uint64ToBytes(clusterID)
+	value := typeutil.Uint64ToBytes(clusterID)
 
 	// Multiple PDs may try to init the cluster ID at the same time.
 	// Only one PD can commit this transaction, then other PDs can get
@@ -119,7 +109,7 @@ func initOrGetClusterID(c *clientv3.Client, key string) (uint64, error) {
 		Else(clientv3.OpGet(key)).
 		Commit()
 	if err != nil {
-		return 0, errors.Trace(err)
+		return 0, errors.WithStack(err)
 	}
 
 	// Txn commits ok, return the generated cluster ID.
@@ -137,115 +127,83 @@ func initOrGetClusterID(c *clientv3.Client, key string) (uint64, error) {
 		return 0, errors.Errorf("txn returns invalid range response: %v", resp)
 	}
 
-	return bytesToUint64(response.Kvs[0].Value)
-}
-
-func bytesToUint64(b []byte) (uint64, error) {
-	if len(b) != 8 {
-		return 0, errors.Errorf("invalid data, must 8 bytes, but %d", len(b))
-	}
-
-	return binary.BigEndian.Uint64(b), nil
-}
-
-func uint64ToBytes(v uint64) []byte {
-	b := make([]byte, 8)
-	binary.BigEndian.PutUint64(b, v)
-	return b
-}
-
-// slowLogTxn wraps etcd transaction and log slow one.
-type slowLogTxn struct {
-	clientv3.Txn
-	cancel context.CancelFunc
-}
-
-func newSlowLogTxn(client *clientv3.Client) clientv3.Txn {
-	ctx, cancel := context.WithTimeout(client.Ctx(), requestTimeout)
-	return &slowLogTxn{
-		Txn:    client.Txn(ctx),
-		cancel: cancel,
-	}
-}
-
-func (t *slowLogTxn) If(cs ...clientv3.Cmp) clientv3.Txn {
-	return &slowLogTxn{
-		Txn:    t.Txn.If(cs...),
-		cancel: t.cancel,
-	}
-}
-
-func (t *slowLogTxn) Then(ops ...clientv3.Op) clientv3.Txn {
-	return &slowLogTxn{
-		Txn:    t.Txn.Then(ops...),
-		cancel: t.cancel,
-	}
-}
-
-// Commit implements Txn Commit interface.
-func (t *slowLogTxn) Commit() (*clientv3.TxnResponse, error) {
-	start := time.Now()
-	resp, err := t.Txn.Commit()
-	t.cancel()
-
-	cost := time.Since(start)
-	if cost > slowRequestTime {
-		log.Warnf("txn runs too slow, resp: %v, err: %v, cost: %s", resp, err, cost)
-	}
-	label := "success"
-	if err != nil {
-		label = "failed"
-	}
-	txnCounter.WithLabelValues(label).Inc()
-	txnDuration.WithLabelValues(label).Observe(cost.Seconds())
-
-	return resp, errors.Trace(err)
-}
-
-// GetMembers return a slice of Members.
-func GetMembers(etcdClient *clientv3.Client) ([]*pdpb.Member, error) {
-	listResp, err := etcdutil.ListEtcdMembers(etcdClient)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-
-	members := make([]*pdpb.Member, 0, len(listResp.Members))
-	for _, m := range listResp.Members {
-		info := &pdpb.Member{
-			Name:       m.Name,
-			MemberId:   m.ID,
-			ClientUrls: m.ClientURLs,
-			PeerUrls:   m.PeerURLs,
-		}
-		members = append(members, info)
-	}
-
-	return members, nil
-}
-
-func parseTimestamp(data []byte) (time.Time, error) {
-	nano, err := bytesToUint64(data)
-	if err != nil {
-		return zeroTime, errors.Trace(err)
-	}
-
-	return time.Unix(0, int64(nano)), nil
-}
-
-func subTimeByWallClock(after time.Time, before time.Time) time.Duration {
-	return time.Duration(after.UnixNano() - before.UnixNano())
+	return typeutil.BytesToUint64(response.Kvs[0].Value)
 }
 
 // InitHTTPClient initials a http client.
 func InitHTTPClient(svr *Server) error {
 	tlsConfig, err := svr.GetSecurityConfig().ToTLSConfig()
 	if err != nil {
-		return errors.Trace(err)
+		return err
 	}
 
-	DialClient = &http.Client{Transport: &http.Transport{
-		TLSClientConfig:   tlsConfig,
-		DisableKeepAlives: true,
-	}}
+	cluster.DialClient = &http.Client{
+		Timeout: clientTimeout,
+		Transport: &http.Transport{
+			TLSClientConfig:   tlsConfig,
+			DisableKeepAlives: true,
+		},
+	}
 	return nil
+}
+
+func makeStoreKey(clusterRootPath string, storeID uint64) string {
+	return path.Join(clusterRootPath, "s", fmt.Sprintf("%020d", storeID))
+}
+
+func makeRegionKey(clusterRootPath string, regionID uint64) string {
+	return path.Join(clusterRootPath, "r", fmt.Sprintf("%020d", regionID))
+}
+
+func makeRaftClusterStatusPrefix(clusterRootPath string) string {
+	return path.Join(clusterRootPath, "status")
+}
+
+func makeBootstrapTimeKey(clusterRootPath string) string {
+	return path.Join(makeRaftClusterStatusPrefix(clusterRootPath), "raft_bootstrap_time")
+}
+
+func checkBootstrapRequest(clusterID uint64, req *pdpb.BootstrapRequest) error {
+	// TODO: do more check for request fields validation.
+
+	storeMeta := req.GetStore()
+	if storeMeta == nil {
+		return errors.Errorf("missing store meta for bootstrap %d", clusterID)
+	} else if storeMeta.GetId() == 0 {
+		return errors.New("invalid zero store id")
+	}
+
+	regionMeta := req.GetRegion()
+	if regionMeta == nil {
+		return errors.Errorf("missing region meta for bootstrap %d", clusterID)
+	} else if len(regionMeta.GetStartKey()) > 0 || len(regionMeta.GetEndKey()) > 0 {
+		// first region start/end key must be empty
+		return errors.Errorf("invalid first region key range, must all be empty for bootstrap %d", clusterID)
+	} else if regionMeta.GetId() == 0 {
+		return errors.New("invalid zero region id")
+	}
+
+	peers := regionMeta.GetPeers()
+	if len(peers) != 1 {
+		return errors.Errorf("invalid first region peer count %d, must be 1 for bootstrap %d", len(peers), clusterID)
+	}
+
+	peer := peers[0]
+	if peer.GetStoreId() != storeMeta.GetId() {
+		return errors.Errorf("invalid peer store id %d != %d for bootstrap %d", peer.GetStoreId(), storeMeta.GetId(), clusterID)
+	}
+	if peer.GetId() == 0 {
+		return errors.New("invalid zero peer id")
+	}
+
+	return nil
+}
+
+func isTiFlashStore(store *metapb.Store) bool {
+	for _, l := range store.GetLabels() {
+		if l.GetKey() == "engine" && l.GetValue() == "tiflash" {
+			return true
+		}
+	}
+	return false
 }

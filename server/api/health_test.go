@@ -16,27 +16,20 @@ package api
 import (
 	"encoding/json"
 	"io/ioutil"
-	"net/http"
 	"strings"
 
 	. "github.com/pingcap/check"
-	"github.com/pingcap/pd/server"
+	"github.com/pingcap/pd/v4/server"
+	"github.com/pingcap/pd/v4/server/config"
 )
 
 var _ = Suite(&testHealthAPISuite{})
 
-type testHealthAPISuite struct {
-	hc *http.Client
-}
+type testHealthAPISuite struct{}
 
-func (s *testHealthAPISuite) SetUpSuite(c *C) {
-	s.hc = newHTTPClient()
-}
-
-func checkSliceResponse(c *C, body []byte, cfgs []*server.Config, unhealth string) {
-	got := []health{}
-	json.Unmarshal(body, &got)
-
+func checkSliceResponse(c *C, body []byte, cfgs []*config.Config, unhealth string) {
+	got := []Health{}
+	c.Assert(json.Unmarshal(body, &got), IsNil)
 	c.Assert(len(got), Equals, len(cfgs))
 
 	for _, h := range got {
@@ -60,16 +53,18 @@ func (s *testHealthAPISuite) TestHealthSlice(c *C) {
 	var leader, follow *server.Server
 
 	for _, svr := range svrs {
-		if svr.IsLeader() {
+		if !svr.IsClosed() && svr.GetMember().IsLeader() {
 			leader = svr
 		} else {
 			follow = svr
 		}
 	}
-	addr := leader.GetConfig().ClientUrls + apiPrefix + "/health"
+	mustBootstrapCluster(c, leader)
+	addr := leader.GetConfig().ClientUrls + apiPrefix + "/api/v1/health"
 	follow.Close()
-	resp, err := s.hc.Get(addr)
+	resp, err := dialClient.Get(addr)
 	c.Assert(err, IsNil)
+	defer resp.Body.Close()
 	buf, err := ioutil.ReadAll(resp.Body)
 	c.Assert(err, IsNil)
 	checkSliceResponse(c, buf, cfgs, follow.GetConfig().Name)

@@ -18,9 +18,9 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/juju/errors"
 	"github.com/pingcap/kvproto/pkg/metapb"
-	"github.com/pingcap/pd/server"
+	"github.com/pingcap/pd/v4/server"
+	"github.com/pkg/errors"
 	"github.com/unrolled/render"
 )
 
@@ -37,14 +37,10 @@ func newLabelsHandler(svr *server.Server, rd *render.Render) *labelsHandler {
 }
 
 func (h *labelsHandler) Get(w http.ResponseWriter, r *http.Request) {
-	cluster := h.svr.GetRaftCluster()
-	if cluster == nil {
-		h.rd.JSON(w, http.StatusInternalServerError, server.ErrNotBootstrapped.Error())
-		return
-	}
+	rc := getCluster(r.Context())
 	var labels []*metapb.StoreLabel
 	m := make(map[string]struct{})
-	stores := cluster.GetStores()
+	stores := rc.GetStores()
 	for _, s := range stores {
 		ls := s.GetLabels()
 		for _, l := range ls {
@@ -58,12 +54,7 @@ func (h *labelsHandler) Get(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *labelsHandler) GetStores(w http.ResponseWriter, r *http.Request) {
-	cluster := h.svr.GetRaftCluster()
-	if cluster == nil {
-		h.rd.JSON(w, http.StatusInternalServerError, server.ErrNotBootstrapped.Error())
-		return
-	}
-
+	rc := getCluster(r.Context())
 	name := r.URL.Query().Get("name")
 	value := r.URL.Query().Get("value")
 	filter, err := newStoresLabelFilter(name, value)
@@ -72,16 +63,17 @@ func (h *labelsHandler) GetStores(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stores := cluster.GetStores()
+	stores := rc.GetMetaStores()
 	storesInfo := &StoresInfo{
 		Stores: make([]*StoreInfo, 0, len(stores)),
 	}
 
 	stores = filter.filter(stores)
 	for _, s := range stores {
-		store, err := cluster.GetStore(s.GetId())
-		if err != nil {
-			h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+		storeID := s.GetId()
+		store := rc.GetStore(storeID)
+		if store == nil {
+			h.rd.JSON(w, http.StatusInternalServerError, server.ErrStoreNotFound(storeID))
 			return
 		}
 
@@ -102,11 +94,11 @@ func newStoresLabelFilter(name, value string) (*storesLabelFilter, error) {
 	// add (?i) to set a case-insensitive flag
 	keyPattern, err := regexp.Compile("(?i)" + name)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, errors.WithStack(err)
 	}
 	valuePattern, err := regexp.Compile("(?i)" + value)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, errors.WithStack(err)
 	}
 	return &storesLabelFilter{
 		keyPattern:   keyPattern,

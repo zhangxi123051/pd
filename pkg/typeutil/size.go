@@ -16,8 +16,8 @@ package typeutil
 import (
 	"strconv"
 
-	gh "github.com/dustin/go-humanize"
-	"github.com/juju/errors"
+	"github.com/docker/go-units"
+	"github.com/pkg/errors"
 )
 
 // ByteSize is a retype uint64 for TOML and JSON.
@@ -25,18 +25,18 @@ type ByteSize uint64
 
 // MarshalJSON returns the size as a JSON string.
 func (b ByteSize) MarshalJSON() ([]byte, error) {
-	return []byte(`"` + gh.IBytes(uint64(b)) + `"`), nil
+	return []byte(`"` + units.BytesSize(float64(b)) + `"`), nil
 }
 
 // UnmarshalJSON parses a JSON string into the bytesize.
 func (b *ByteSize) UnmarshalJSON(text []byte) error {
 	s, err := strconv.Unquote(string(text))
 	if err != nil {
-		return errors.Trace(err)
+		return errors.WithStack(err)
 	}
-	v, err := gh.ParseBytes(s)
+	v, err := units.RAMInBytes(s)
 	if err != nil {
-		return errors.Trace(err)
+		return errors.WithStack(err)
 	}
 	*b = ByteSize(v)
 	return nil
@@ -44,9 +44,9 @@ func (b *ByteSize) UnmarshalJSON(text []byte) error {
 
 // UnmarshalText parses a Toml string into the bytesize.
 func (b *ByteSize) UnmarshalText(text []byte) error {
-	v, err := gh.ParseBytes(string(text))
+	v, err := units.RAMInBytes(string(text))
 	if err != nil {
-		return errors.Trace(err)
+		return errors.WithStack(err)
 	}
 	*b = ByteSize(v)
 	return nil

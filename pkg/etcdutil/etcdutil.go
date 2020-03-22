@@ -19,11 +19,13 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/coreos/etcd/clientv3"
-	"github.com/coreos/etcd/etcdserver"
-	"github.com/coreos/etcd/pkg/types"
-	"github.com/juju/errors"
-	log "github.com/sirupsen/logrus"
+	"github.com/gogo/protobuf/proto"
+	"github.com/pingcap/log"
+	"github.com/pkg/errors"
+	"go.etcd.io/etcd/clientv3"
+	"go.etcd.io/etcd/etcdserver"
+	"go.etcd.io/etcd/pkg/types"
+	"go.uber.org/zap"
 )
 
 const (
@@ -59,7 +61,7 @@ func CheckClusterID(localClusterID types.ID, um types.URLsMap, tlsConfig *tls.Co
 		trp.CloseIdleConnections()
 		if gerr != nil {
 			// Do not return error, because other members may be not ready.
-			log.Error(gerr)
+			log.Error("failed to get cluster from remote", zap.Error(gerr))
 			continue
 		}
 
@@ -76,7 +78,7 @@ func AddEtcdMember(client *clientv3.Client, urls []string) (*clientv3.MemberAddR
 	ctx, cancel := context.WithTimeout(client.Ctx(), DefaultRequestTimeout)
 	addResp, err := client.MemberAdd(ctx, urls)
 	cancel()
-	return addResp, errors.Trace(err)
+	return addResp, errors.WithStack(err)
 }
 
 // ListEtcdMembers returns a list of internal etcd members.
@@ -84,7 +86,7 @@ func ListEtcdMembers(client *clientv3.Client) (*clientv3.MemberListResponse, err
 	ctx, cancel := context.WithTimeout(client.Ctx(), DefaultRequestTimeout)
 	listResp, err := client.MemberList(ctx)
 	cancel()
-	return listResp, errors.Trace(err)
+	return listResp, errors.WithStack(err)
 }
 
 // RemoveEtcdMember removes a member by the given id.
@@ -92,5 +94,64 @@ func RemoveEtcdMember(client *clientv3.Client, id uint64) (*clientv3.MemberRemov
 	ctx, cancel := context.WithTimeout(client.Ctx(), DefaultRequestTimeout)
 	rmResp, err := client.MemberRemove(ctx, id)
 	cancel()
-	return rmResp, errors.Trace(err)
+	return rmResp, errors.WithStack(err)
+}
+
+// EtcdKVGet returns the etcd GetResponse by given key or key prefix
+func EtcdKVGet(c *clientv3.Client, key string, opts ...clientv3.OpOption) (*clientv3.GetResponse, error) {
+	ctx, cancel := context.WithTimeout(c.Ctx(), DefaultRequestTimeout)
+	defer cancel()
+
+	start := time.Now()
+	resp, err := clientv3.NewKV(c).Get(ctx, key, opts...)
+	if err != nil {
+		log.Error("load from etcd meet error", zap.Error(err))
+	}
+	if cost := time.Since(start); cost > DefaultSlowRequestTime {
+		log.Warn("kv gets too slow", zap.String("request-key", key), zap.Duration("cost", cost), zap.Error(err))
+	}
+
+	return resp, errors.WithStack(err)
+}
+
+// GetValue gets value with key from etcd.
+func GetValue(c *clientv3.Client, key string, opts ...clientv3.OpOption) ([]byte, error) {
+	resp, err := get(c, key, opts...)
+	if err != nil {
+		return nil, err
+	}
+	if resp == nil {
+		return nil, nil
+	}
+	return resp.Kvs[0].Value, nil
+}
+
+func get(c *clientv3.Client, key string, opts ...clientv3.OpOption) (*clientv3.GetResponse, error) {
+	resp, err := EtcdKVGet(c, key, opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	if n := len(resp.Kvs); n == 0 {
+		return nil, nil
+	} else if n > 1 {
+		return nil, errors.Errorf("invalid get value resp %v, must only one", resp.Kvs)
+	}
+	return resp, nil
+}
+
+// GetProtoMsgWithModRev returns boolean to indicate whether the key exists or not.
+func GetProtoMsgWithModRev(c *clientv3.Client, key string, msg proto.Message, opts ...clientv3.OpOption) (bool, int64, error) {
+	resp, err := get(c, key, opts...)
+	if err != nil {
+		return false, 0, err
+	}
+	if resp == nil {
+		return false, 0, nil
+	}
+	value := resp.Kvs[0].Value
+	if err = proto.Unmarshal(value, msg); err != nil {
+		return false, 0, errors.WithStack(err)
+	}
+	return true, resp.Kvs[0].ModRevision, nil
 }

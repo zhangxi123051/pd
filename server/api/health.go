@@ -16,7 +16,8 @@ package api
 import (
 	"net/http"
 
-	"github.com/pingcap/pd/server"
+	"github.com/pingcap/pd/v4/server"
+	"github.com/pingcap/pd/v4/server/cluster"
 	"github.com/unrolled/render"
 )
 
@@ -25,7 +26,8 @@ type healthHandler struct {
 	rd  *render.Render
 }
 
-type health struct {
+// Health reflects the cluster's health.
+type Health struct {
 	Name       string   `json:"name"`
 	MemberID   uint64   `json:"member_id"`
 	ClientUrls []string `json:"client_urls"`
@@ -41,22 +43,23 @@ func newHealthHandler(svr *server.Server, rd *render.Render) *healthHandler {
 
 func (h *healthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	client := h.svr.GetClient()
-	members, err := server.GetMembers(client)
+	members, err := cluster.GetMembers(client)
 	if err != nil {
 		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	unhealthMembers := h.svr.CheckHealth(members)
-	healths := []health{}
+
+	healthMembers := cluster.CheckHealth(members)
+	healths := []Health{}
 	for _, member := range members {
-		h := health{
+		h := Health{
 			Name:       member.Name,
 			MemberID:   member.MemberId,
 			ClientUrls: member.ClientUrls,
-			Health:     true,
+			Health:     false,
 		}
-		if _, ok := unhealthMembers[member.GetMemberId()]; ok {
-			h.Health = false
+		if _, ok := healthMembers[member.GetMemberId()]; ok {
+			h.Health = true
 		}
 		healths = append(healths, h)
 	}

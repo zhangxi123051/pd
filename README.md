@@ -1,35 +1,36 @@
-# PD 
+# PD
 
 [![TravisCI Build Status](https://travis-ci.org/pingcap/pd.svg?branch=master)](https://travis-ci.org/pingcap/pd)
-![Project Status](https://img.shields.io/badge/version-1.0-green.svg)
-[![CircleCI Build Status](https://circleci.com/gh/pingcap/pd.svg?style=shield)](https://circleci.com/gh/pingcap/pd)
+![GitHub release](https://img.shields.io/github/release/pingcap/pd.svg)
 [![Go Report Card](https://goreportcard.com/badge/github.com/pingcap/pd)](https://goreportcard.com/report/github.com/pingcap/pd)
-[![Coverage Status](https://coveralls.io/repos/github/pingcap/pd/badge.svg?branch=master)](https://coveralls.io/github/pingcap/pd?branch=master)
+[![codecov](https://codecov.io/gh/pingcap/pd/branch/master/graph/badge.svg)](https://codecov.io/gh/pingcap/pd)
 
-PD is the abbreviation for Placement Driver. It is used to manage and schedule the [TiKV](https://github.com/pingcap/tikv) cluster. 
+PD is the abbreviation for Placement Driver. It is used to manage and schedule the [TiKV](https://github.com/tikv/tikv) cluster.
 
-PD supports distribution and fault-tolerance by embedding [etcd](https://github.com/coreos/etcd). 
+PD supports distribution and fault-tolerance by embedding [etcd](https://github.com/etcd-io/etcd).
+
+[<img src="docs/contribution-map.png" alt="contribution-map" width="180">](https://github.com/pingcap/tidb-map/blob/master/maps/contribution-map.md#pd-placement-driver-for-tikv)
+
+If you're interested in contributing to PD, see [CONTRIBUTING.md](./CONTRIBUTING.md). For more contributing information, please click on the contributor icon above.
 
 ## Build
 
-1. Make sure [​*Go*​](https://golang.org/) (version 1.8+) is installed.
-2. Ensure your `$GOPATH` is set. (For example, `export GOPATH=$HOME/go`)
-3. Clone the repository with `git clone git@github.com:pingcap/pd.git $GOPATH/src/github.com/pingcap/pd`.
-4. Use `make` to install PD. PD is installed in the `bin` directory.
+1. Make sure [​*Go*​](https://golang.org/) (version 1.13) is installed.
+2. Use `make` to install PD. PD is installed in the `bin` directory.
 
 ## Usage
 
 ### Command flags
 
-See [configuration](https://github.com/pingcap/docs/blob/master/op-guide/configuration.md#placement-driver-pd).
+See [PD Configuration Flags](https://pingcap.com/docs/dev/reference/configuration/pd-server/configuration/#pd-configuration-flags).
 
 ### Single Node with default ports
 
-You can run `pd-server` directly on your local machine, if you want to connect to PD from outside, 
+You can run `pd-server` directly on your local machine, if you want to connect to PD from outside,
 you can let PD listen on the host IP.
 
 ```bash
-# Set correct HostIP here. 
+# Set correct HostIP here.
 export HostIP="192.168.199.105"
 
 pd-server --name="pd" \
@@ -42,30 +43,44 @@ pd-server --name="pd" \
 Using `curl` to see PD member:
 
 ```bash
-curl http://${HostIP}:2379/v2/members
+curl http://${HostIP}:2379/pd/api/v1/members
 
-{"members":[{"id":"f62e88a6e81c149","name":"pd","peerURLs":["http://192.168.199.105:2380"],"clientURLs":["http://192.168.199.105:2379"]}]}
+{
+    "members": [
+        {
+            "name":"pd",
+            "member_id":"f62e88a6e81c149",
+            "peer_urls": [
+                "http://192.168.199.105:2380"
+            ],
+            "client_urls": [
+                "http://192.168.199.105:2379"
+            ]
+        }
+    ]
+}
 ```
 
 A better tool [httpie](https://github.com/jkbrzt/httpie) is recommended:
 
 ```bash
-http http://${HostIP}:2379/v2/members
-HTTP/1.1 200 OK
-Content-Length: 144
-Content-Type: application/json
-Date: Thu, 21 Jul 2016 09:37:12 GMT
-X-Etcd-Cluster-Id: 33dc747581249309
+http http://${HostIP}:2379/pd/api/v1/members
+Access-Control-Allow-Headers: accept, content-type, authorization
+Access-Control-Allow-Methods: POST, GET, OPTIONS, PUT, DELETE
+Access-Control-Allow-Origin: *
+Content-Length: 673
+Content-Type: application/json; charset=UTF-8
+Date: Thu, 20 Feb 2020 09:49:42 GMT
 
 {
     "members": [
         {
-            "clientURLs": [
+            "client_urls": [
                 "http://192.168.199.105:2379"
-            ], 
-            "id": "f62e88a6e81c149", 
-            "name": "pd", 
-            "peerURLs": [
+            ],
+            "member_id": "f62e88a6e81c149",
+            "name": "pd",
+            "peer_urls": [
                 "http://192.168.199.105:2380"
             ]
         }
@@ -77,20 +92,20 @@ X-Etcd-Cluster-Id: 33dc747581249309
 
 You can use the following command to build a PD image directly:
 
-```
+```bash
 docker build -t pingcap/pd .
 ```
 
 Or you can also use following command to get PD from Docker hub:
 
-```
+```bash
 docker pull pingcap/pd
 ```
 
-Run a single node with Docker: 
+Run a single node with Docker:
 
 ```bash
-# Set correct HostIP here. 
+# Set correct HostIP here.
 export HostIP="192.168.199.105"
 
 docker run -d -p 2379:2379 -p 2380:2380 --name pd pingcap/pd \
@@ -105,9 +120,9 @@ docker run -d -p 2379:2379 -p 2380:2380 --name pd pingcap/pd \
 
 ### Cluster
 
-PD is a component in TiDB project, you must run it with TiDB and TiKV together, see 
-[binary deployment](https://github.com/pingcap/docs/blob/master/op-guide/binary-deployment.md) to learn 
-how to set up the cluster and run them.
+PD is a component in TiDB project, you must run it with TiDB and TiKV together, see
+[TiDB-Ansible](https://pingcap.com/docs/dev/how-to/deploy/orchestrated/ansible/#deploy-tidb-using-ansible)
+to learn how to set up the cluster and run them.
 
-You can also use [Docker](https://github.com/pingcap/docs/blob/master/op-guide/docker-deployment.md) to 
-run the cluster.
+You can also use [Docker](https://pingcap.com/docs/dev/how-to/deploy/orchestrated/docker/#deploy-tidb-using-docker)
+to run the cluster.

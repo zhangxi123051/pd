@@ -16,7 +16,7 @@ package api
 import (
 	"net/http"
 
-	"github.com/pingcap/pd/server"
+	"github.com/pingcap/pd/v4/server"
 	"github.com/unrolled/render"
 )
 
@@ -25,11 +25,12 @@ type hotStatusHandler struct {
 	rd *render.Render
 }
 
-type hotStoreStats struct {
-	BytesWriteStats map[uint64]uint64 `json:"bytes-write-rate,omitempty"`
-	BytesReadStats  map[uint64]uint64 `json:"bytes-read-rate,omitempty"`
-	KeysWriteStats  map[uint64]uint64 `json:"keys-write-rate,omitempty"`
-	KeysReadStats   map[uint64]uint64 `json:"keys-read-rate,omitempty"`
+// HotStoreStats is used to record the status of hot stores.
+type HotStoreStats struct {
+	BytesWriteStats map[uint64]float64 `json:"bytes-write-rate,omitempty"`
+	BytesReadStats  map[uint64]float64 `json:"bytes-read-rate,omitempty"`
+	KeysWriteStats  map[uint64]float64 `json:"keys-write-rate,omitempty"`
+	KeysReadStats   map[uint64]float64 `json:"keys-read-rate,omitempty"`
 }
 
 func newHotStatusHandler(handler *server.Handler, rd *render.Render) *hotStatusHandler {
@@ -51,9 +52,9 @@ func (h *hotStatusHandler) GetHotStores(w http.ResponseWriter, r *http.Request) 
 	bytesWriteStats := h.GetHotBytesWriteStores()
 	bytesReadStats := h.GetHotBytesReadStores()
 	keysWriteStats := h.GetHotKeysWriteStores()
-	keysReadStats := h.GetHotKeysWriteStores()
+	keysReadStats := h.GetHotKeysReadStores()
 
-	stats := hotStoreStats{
+	stats := HotStoreStats{
 		BytesWriteStats: bytesWriteStats,
 		BytesReadStats:  bytesReadStats,
 		KeysWriteStats:  keysWriteStats,
